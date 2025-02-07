@@ -1,0 +1,205 @@
+---
+title: "GSVA analysis"
+output: html_notebook
+---
+```{r}
+library(GSVA)
+library(ggplot2)
+library(DESeq2)
+library(clusterProfiler)
+library(tidyverse)
+library(msigdbr)
+library(ggh4x)
+# create directory if it doesnt exist
+dir.create("results/plot/04_ssGSEA", showWarnings = FALSE)
+```
+
+load dataset
+```{r}
+file_name <- list.files("results/dds/")
+# only rds
+file_name <- file_name[grepl("rds", file_name)]
+# take the most recent file
+file_name <- file_name[length(file_name)]
+dds <- readRDS(paste0("results/dds/", file_name))
+```
+
+get vsd
+
+```{r}
+	vsd <- vst(dds, blind=FALSE)
+	# make dataframe with counts
+	vsd <- assay(vsd)
+# gene xpression matrix
+count_matrix <- as.matrix(vsd)
+count_matrix <- counts(dds, normalized=TRUE)
+```
+
+
+load metadata
+```{r}
+sample_metadata <- read_delim("data/metadata_processed/metadata.txt")
+```
+
+# BTM_plus
+load BTM_plus
+```{r}
+btm_plus_mmul_t2g <- read_delim("data/GSEA_sets/BTM_plus_mmul_t2g.tsv")
+# split it so it is a list of vectors of genes named by the term
+btm_plus_gene_sets <- split(btm_plus_mmul_t2g$ensembl_gene_id, btm_plus_mmul_t2g$term)
+```
+
+load enriched pathways
+```{r}
+compare_cluster_res <- readRDS("results/tables/GSEA_compare_btm_plus.rds")
+enriched_pathways <- compare_cluster_res@compareClusterResult %>%
+		filter(p.adjust < 0.05) %>%
+  filter(grepl("Treat", Cluster)) %>% # only pathways enriched in E2-effects
+  distinct(ID) %>% pull(ID)
+# filter the btm_plus gene sets
+btm_plus_gene_sets <- btm_plus_gene_sets[enriched_pathways]
+```
+
+## GSVA
+```{r}
+param_obj <- gsvaParam(count_matrix, btm_plus_gene_sets,
+                         minSize = 1, maxSize = 500)
+results <- gsva(param_obj)
+```
+
+
+make long version of ssGSEA results with sample metadata
+```{r}
+results_ssGSEA <- as.data.frame(results) %>%
+    rownames_to_column(var = "module") %>%
+  gather(key = "sample", value = "ssGSEA_score", -module) %>%
+    left_join(sample_metadata, by = c("sample" = "Sample"))
+```
+
+
+#  hallmark
+
+
+
+```{r}
+# prepare msig database - hallmark
+Mmmu_msig_dbs <- msigdbr(species = "Macaca mulatta", "H")
+msigdbr_t2g <- Mmmu_msig_dbs %>% dplyr::distinct(gs_name, ensembl_gene) %>% as.data.frame()
+# split
+hallmark_gene_sets <- split(msigdbr_t2g$ensembl_gene, msigdbr_t2g$gs_name)
+```
+
+
+load enriched pathways
+```{r}
+compare_hallmark_res <- readRDS("results/tables/GSEA_hallmark_compare.rds")
+enriched_hallmarks <- compare_hallmark_res@compareClusterResult %>%
+		filter(p.adjust < 0.05)	%>%
+		filter(grepl("Treat", Cluster)) %>% # only pathways enriched in E2-effects
+		distinct(ID) %>% pull(ID)
+# filter the btm_plus gene sets
+hallmark_gene_sets <- hallmark_gene_sets[enriched_hallmarks]
+```
+
+## GSVA
+```{r}
+param_obj <- gsvaParam(count_matrix, hallmark_gene_sets,
+                         minSize = 1, maxSize = 500)
+results_hallmark <- gsva(param_obj)
+```
+
+make long format for plotting
+```{r}
+results_ssGSEA_hallmark <- as.data.frame(results_hallmark) %>%
+    rownames_to_column(var = "module") %>%
+  gather(key = "sample", value = "ssGSEA_score", -module) %>%
+    left_join(sample_metadata, by = c("sample" = "Sample"))
+```
+
+
+
+# combine databases
+prepare each data
+
+```{r}
+# btm
+data_btm <- results_ssGSEA %>%
+		mutate(week_string = paste0("Treatment", Treatment, ".Week_post_FHT", Week_post_FHT)) %>%
+		left_join(compare_cluster_res@compareClusterResult %>% filter(grepl("Treat", Cluster)) %>% mutate(Cluster = as.character(Cluster)),
+				  by = c("module" = "ID", "week_string" = "Cluster")) %>%
+		dplyr::select(-c(week_string)) %>%
+		group_by(Animal, module) %>%
+		mutate(ssGSEA_score = ssGSEA_score - ssGSEA_score[Week_post_FHT == 0]) %>%
+		# calculate average score for each module for E2 and order from highest to lowest
+		group_by(module, Treatment) %>%
+		mutate(mean_score_geneset = mean(ssGSEA_score, na.rm = T)) %>% ungroup() %>%
+		group_by(Treatment, Week_post_FHT, module) %>%
+		mutate(mean_score = mean(ssGSEA_score, na.rm = T), sd_score = sd(ssGSEA_score, na.rm = T)) %>%
+		ungroup() %>%
+		# add significance stars
+		mutate(sign = ifelse(p.adjust < 0.01, "**",
+							 ifelse(p.adjust < 0.05, "*", "")))
+
+
+# hallmark
+data_hall <- results_ssGSEA_hallmark %>%
+		mutate(week_string = paste0("Treatment", Treatment, ".Week_post_FHT", Week_post_FHT)) %>%
+		left_join(compare_hallmark_res@compareClusterResult %>% filter(grepl("Treat", Cluster)) %>% mutate(Cluster = as.character(Cluster)),
+				  by = c("module" = "ID", "week_string" = "Cluster")) %>%
+		dplyr::select(-c(week_string)) %>%
+		group_by(Animal, module) %>%
+		mutate(ssGSEA_score = ssGSEA_score - ssGSEA_score[Week_post_FHT == 0]) %>%
+		# calculate average score for each module for E2 and order from highest to lowest
+		group_by(module, Treatment) %>%
+		mutate(mean_score_geneset = mean(ssGSEA_score, na.rm = T)) %>% ungroup() %>%
+		group_by(Treatment, Week_post_FHT, module) %>%
+		mutate(mean_score = mean(ssGSEA_score, na.rm = T), sd_score = sd(ssGSEA_score, na.rm = T)) %>%
+		ungroup() %>%
+		# add significance stars
+		mutate(sign = ifelse(p.adjust < 0.01, "**",
+							 ifelse(p.adjust < 0.05, "*", "")))
+
+
+# bind
+data <- bind_rows(data_btm, data_hall)
+data <- data %>%
+		mutate(module=ifelse(grepl("HALLMARK", module),
+                     paste0((tolower(gsub("HALLMARK_", "", module))), "(H)"),
+                     paste0(module, "(B)"))) %>% # change hallmark to lower case and add BTM
+				mutate(module = gsub(" \\(I", "(I", module)) %>%
+		mutate(module = gsub("_", " ", module)) # replace spaces with underscore
+# order facet
+data <- data %>%
+		mutate(module = factor(module, levels = data %>% filter(Treatment == "E2") %>% arrange(desc(mean_score_geneset)) %>% pull(module) %>% unique())) # order by E2 effect
+
+max_score <- max(abs(c(data$mean_score + data$sd_score, data$mean_score - data$sd_score)), na.rm = T)
+
+```
+
+
+
+
+lineplot but with animal lines
+```{r}
+line_plot_comb <- data %>%
+		ggplot(aes(x = Week_post_FHT, y = mean_score, fill=factor(Treatment, levels = c("Placebo", "E2")))) +
+		geom_vline(xintercept = c(18.5,22), linetype = "dashed") +
+		geom_ribbon(aes(ymin = mean_score - sd_score, ymax = mean_score + sd_score)) +
+		geom_line(aes(group=Animal, y =ssGSEA_score, color =factor(Treatment, levels = c("Placebo", "E2"))))+
+		#geom_line(aes(color=factor(Treatment, levels = c("Placebo", "E2"))), linewidth = 1, linetype="dashed") +
+		#geom_text(data= data[data$Treatment== "E2" & data$Animal == "Rh-11",], aes(label = sign, x=Week_post_FHT, y=max_score*0.8), size = 5) +
+		#geom_text(data= data[(data$Treatment== "E2" & data$p.adjust <0.05),], aes(label = "*", x=Week_post_FHT, y=1)) +
+		scale_fill_manual(values = c("E2" = "#8A69D450", "Placebo" = "#ffcc3370")) +
+		scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+		ylim(-max_score, max_score) +
+		labs(x= "Week post FHT", y = expression(paste(Delta,"ssGSEA score")), fill ="Treatment", color = "Treatment") +
+		scale_x_continuous(breaks = c(0,7,13,18,19,23,27), labels = c("0", "7", "13", "18", "", "23", "27") ) +
+  		facet_wrap(~module, labeller = labeller(module = label_wrap_gen(width = 24)))+
+		theme_minimal() +
+		theme(panel.grid.minor = element_blank())
+line_plot_comb
+saveRDS(line_plot_comb, "results/plot/04_ssGSEA/ssGSEA_lineplot_comb.rds")
+
+ggsave("results/plot/04_ssGSEA/line_plot_comb.pdf", line_plot_comb, width=15, height=10, dpi=600)
+
+```

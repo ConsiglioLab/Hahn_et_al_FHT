@@ -1,0 +1,985 @@
+---
+title: "GSEA analysis"
+output: html_notebook
+---
+
+```{r}
+library(clusterProfiler)
+library(ggplot2)
+library(tidyverse)
+library(msigdbr)
+library(readxl)
+library(DESeq2)
+library(ggh4x)
+library(org.Mmu.eg.db)
+library(openxlsx)
+library(patchwork)
+library(ggrepel)
+library(ggpp)
+set.seed(74893)
+# create /results/plot/03_GSEA directory if it doesn't exist
+if(!dir.exists("results/plot")) dir.create("results/plot", showWarnings = FALSE)
+```
+
+load dataset
+```{r}
+file_name <- list.files("results/dds/")
+# only rds
+file_name <- file_name[grepl("rds", file_name)]
+# take the most recent file
+file_name <- file_name[length(file_name)]
+dds <- readRDS(paste0("results/dds/", file_name))
+```
+
+load other files
+```{r}
+# load gene set categories
+geneset_category_btmplus <- read_delim("data/GSEA_sets/gene_set_categories_btmplus.tsv") %>%
+		dplyr::select(unique_terms, general_category)
+geneset_category_Hallmark <- read_delim("data/GSEA_sets/gene_set_categories_Hallmark.tsv") %>%
+		mutate(general_category = general_category_simplified) %>% dplyr::select(-general_category_simplified)
+geneset_category <- bind_rows(geneset_category_btmplus, geneset_category_Hallmark)
+# load translation
+trans_table <- read_delim("data/Macaca_mulatta_genome/trans.table.tsv")
+# sample metadata
+sample_metadata <- read_delim("data/metadata_processed/metadata.txt")
+```
+
+
+
+ load databases
+
+
+```{r}
+# prepare msig database - hallmark
+Mmmu_msig_dbs <- msigdbr(species = "Macaca mulatta", "H")
+msigdbr_t2g <- Mmmu_msig_dbs %>% dplyr::distinct(gs_name, ensembl_gene) %>% as.data.frame()
+# btm
+btm_plus_mmul_t2g <- read_delim("data/GSEA_sets/BTM_plus_mmul_t2g.tsv")
+
+
+
+```
+
+
+
+
+# run
+
+Prepare gene lists for every week
+```{r}
+# compare weeks
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[result_names != "Intercept"]
+# with grepl
+result_names <- result_names[grepl("E2.Week", result_names)]
+
+
+gene_weeks <- list()
+for (name in seq_along(result_names)) {
+		# get gene_list
+	res <- results(dds, name=result_names[name])
+	#res <- lfcShrink(dds, coef=result_names[name])
+	gene_list <- res$log2FoldChange
+	names(gene_list) <- rownames(res)
+	#omit NA
+	gene_list <- gene_list[!is.na(gene_list)]
+	# sort
+	gene_list <- sort(gene_list, decreasing = TRUE)
+	# add to list
+	gene_weeks[[paste(result_names[name])]] <- gene_list
+}
+
+
+```
+## msig
+
+
+run msig
+```{r}
+compare_data_gsea <- compareCluster(gene_weeks, fun = "GSEA",seed=TRUE,
+									TERM2GENE = msigdbr_t2g, pvalueCutoff = 1,
+									pAdjustMethod = "BH", verbose = FALSE)
+
+# save the table in excel
+write.xlsx(compare_data_gsea@compareClusterResult, "results/tables/GSEA_hallmark_compare.xlsx")
+# and rds
+saveRDS(compare_data_gsea, "results/tables/GSEA_hallmark_compare.rds")
+```
+
+
+## btm_plus run
+run btm
+
+```{r}
+compare_data_gsea_btm <- compareCluster(gene_weeks, fun = "GSEA",seed=TRUE,
+										TERM2GENE = btm_plus_mmul_t2g, pvalueCutoff= 1,
+										pAdjustMethod = "BH", verbose = FALSE)
+
+write.xlsx(compare_data_gsea_btm@compareClusterResult, "results/tables/GSEA_compare_btm_plus.xlsx")
+saveRDS(compare_data_gsea_btm, "results/tables/GSEA_compare_btm_plus.rds")
+```
+run btm by week
+
+
+
+# Plots
+
+Prepare data for plots and then join all the databases together
+
+```{r}
+display_res_names_E2 <- c("TreatmentE2.Week_post_FHT7" = "7",
+					   "TreatmentE2.Week_post_FHT13" = "13",
+					   "TreatmentE2.Week_post_FHT18" = "18",
+					   "TreatmentE2.Week_post_FHT19" = "19",
+					   "TreatmentE2.Week_post_FHT23" = "23",
+					   "TreatmentE2.Week_post_FHT27" = "27")
+
+```
+
+
+msig
+```{r}
+sign_pathways <- compare_data_gsea@compareClusterResult %>%
+		filter(p.adjust < 0.05) %>% # only significant pathways
+		dplyr::select(ID) %>% pull()
+E2_effects_dotplot_hall <- compare_data_gsea %>%
+		filter(ID %in% sign_pathways) %>% # only significant pathways
+		dotplot( showCategory=20, title="Hallmark", x = "Cluster", color="NES")
+
+data_hall <- E2_effects_dotplot_hall$data %>% as.data.frame() %>%
+		left_join(geneset_category, by = c("ID"= "unique_terms")) %>%
+		mutate(db = "Hallmark")
+```
+
+
+btm
+
+```{r}
+sign_pathways <- compare_data_gsea_btm@compareClusterResult %>%
+		filter(p.adjust < 0.05) %>% # only significant pathways
+		dplyr::select(ID) %>% pull()
+
+E2_effects_dotplot_btm <- compare_data_gsea_btm %>%
+		filter(ID %in% sign_pathways) %>% # only significant pathways
+		dotplot( showCategory=20, title="Hallmark", x = "Cluster", color="NES")
+
+data_btm <- E2_effects_dotplot_btm$data %>% as.data.frame() %>%
+		left_join(geneset_category, by = c("ID"= "unique_terms")) %>%
+mutate(db = "BTM")
+```
+
+
+bind data from each plot
+
+```{r}
+str_wrap_factor <- function(x, ...) {
+  levels(x) <- str_wrap(levels(x), ...)
+  x
+}
+dotplot_data <- bind_rows(data_hall, data_btm) %>%
+		mutate(db = factor(db, levels = c("Hallmark", "BTM"))) %>%
+		mutate(p.adjust=ifelse(p.adjust < 0.05, 0.05, 1)) %>%
+		mutate(general_category = ifelse(general_category== "Immune Response", "Innate Immune Response", general_category)) %>%
+		group_by(ID) %>%
+		mutate(.sign = ifelse(sum(NES) > 0, "Upregulated", "Downregulated")) %>%
+		mutate(.sign = factor(.sign, levels = c("Upregulated", "Downregulated")) )
+
+category_order <- c("T cell", "Natural Killer Cell", "Metabolism", "Cell Process", "Innate Immune Response", "Neutrophil", "Monocyte", "Dendritic Cell", "Other")
+
+dotplot_data <- dotplot_data %>%
+		mutate(general_category = factor(general_category, levels = category_order)) %>%
+		mutate(general_category = str_wrap_factor(general_category, 12))
+
+
+max_NES <- max(abs(dotplot_data$NES))
+```
+
+
+
+make dotplot
+
+```{r}
+dotplot_compare <- dotplot_data %>%
+  mutate(ID = ifelse(grepl("HALLMARK", ID),
+                     paste0((tolower(gsub("HALLMARK_", "", ID))), "(H)"),
+                     paste0(ID, "(B)"))) %>%
+		ungroup() %>%
+		# bin NES
+		mutate(NES_bin = cut(NES, breaks = c(-Inf, -2, -1, 1, 2, Inf), labels = F)  - 3 )%>%
+		ggplot(aes(x = Cluster, y = ID, color = factor(NES_bin, levels = c(-2,-1,0,1,2)))) +
+		geom_point( aes(shape =as.factor(p.adjust), stroke=abs(NES)), size=3) +
+#		facet_nested(.sign +general_category~1,  scales = "free_y", space = "free_y",
+#		             strip = strip_nested(text_y = list(element_blank(), element_text()), size = "variable",
+#					 						by_layer_y = TRUE)) +
+		facet_nested(general_category~1, scales="free_y", space="free_y") +
+		# add vertical line
+		geom_vline(xintercept = 3.5, linetype = "dashed") +
+		geom_vline(xintercept = 4.5, linetype = "dashed") +
+#		scale_color_gradient2(midpoint = 0, mid = "gray", high = "darkred", low = "darkblue",
+#							   limits = c(-max_NES, max_NES),
+#							  breaks = c(2,1,0,-1,-2), oob = scales::squish,
+#							  labels = c(" 2 Upregulated in E2"," 1", " 0", "-1", "-2 Downregulated in E2")) +
+		# scale_color_stepsn(#midpoint = 0, mid = "white", high = "darkred", low = "darkblue",
+		# 					colours = c( "#00008B","#9999ff", "grey", "#ffb3b3", "#8B0000"),
+		# 					   limits = c(-max_NES, max_NES),
+		# 					  breaks = c(2,1,0,-1,-2), oob = scales::squish,
+		# 					  labels = c(" >2 Upregulated in E2"," >1", " 0", "<-1", "<-2 Downregulated in E2")) +
+		scale_color_discrete(type = c("#00008B","#7878A7", "#B6B6B6", "#A77878", "#8B0000"),
+		                     labels=c("> 2", "> 1", "0", "< -1", "< -2")) +
+		scale_x_discrete(labels = display_res_names_E2,
+						 limits = names(display_res_names_E2)) +
+		scale_y_discrete(labels = function(x) str_wrap(gsub("_", " ", x), width = 30)) +
+		continuous_scale("stroke", "stroke",
+                 palette = scales::rescale_pal(c(0, 5)),
+                 breaks = c(-2, -1,-0.5 ,0.5, 1.0, 2.0)) +
+		#scale_size(breaks = c(-2, -1,-0.5 ,0.5, 1.0, 2.0), range=c(1.3,4)) +
+#		scale_size_manual(breaks = c(-2, -1,-0.5 ,0.5, 1.0, 2.0), values = c(4, 2, 1.3, 1.3, 2, 4),
+#		                  labels = c("-2", "-1", "-0.5", "0.5", "1", "2")) +
+#				scale_alpha_discrete( range= c(1,0.4), breaks = c(0.05, 1), labels = c( "< 0.05", "n.s." )) +
+		scale_shape_manual(values = c(19,1), labels = c("< 0.05", "n.s.")) +
+		labs(color="NES", size= "Absolute NES", shape = "Adjusted p-value",
+				 title = "Estradiol effects on gene expression",
+				x = NULL, y = "Enriched gene sets") +
+		guides(color=guide_legend(override.aes = list(shape=19, stroke=c(5,2.5,0,2.5,5), colour=c("#8B0000","#A77878", "#B6B6B6", "#7878A7", "#00008B"))),
+		       stroke="none",
+				shape=guide_legend(override.aes = list(stroke=3))) +
+		theme_minimal() +
+		theme(axis.text.y  = element_text(lineheight = 0.8, size = 8.5),
+			  legend.text = element_text(hjust = 1),
+			  #ggh4x.facet.nestline.y=element_line(color = "black", size = 0.5),
+			  strip.background.y = element_rect(fill = "#f7f4ed", color="white"),
+		       strip.text.y.right = element_text(angle = 0))
+dotplot_compare
+```
+
+save plot
+
+```{r}
+ggsave("results/plot/03_GSEA/GSEA_dotplot_all_db.pdf",dotplot_compare, width = 10, height = 10, dpi = 600)
+# save rds
+saveRDS(dotplot_compare, "results/plot/03_GSEA/GSEA_dotplot_all_db.rds")
+```
+
+
+
+
+
+## other
+
+
+Now do GSEA as before
+
+
+
+Created selected modules plot
+```{r}
+modules <- c("enriched in NK cells (I)", "T cell activation (I)", "HALLMARK_HEME_METABOLISM", "HALLMARK_INTERFERON_ALPHA_RESPONSE", "HALLMARK_INTERFERON_GAMMA_RESPONSE", "enriched in activated dendritic cells (II)")
+
+# vsd and compare_data_gsea_btm
+vsd <- vst(dds, blind=FALSE)
+	# make dataframe with counts
+vsd <- assay(vsd)
+vsd_long <- t(scale(t(vsd))) %>% as.data.frame() %>%
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample") %>%
+			left_join(trans_table, by = c("Gene" = "ensembl_gene_id"), relationship = "many-to-many")
+
+# add gsea results
+compare_long <- compare_data_gsea_btm@compareClusterResult %>%
+				as.data.frame() %>%
+			separate_rows(core_enrichment, sep = "/") %>%
+			arrange(ID, desc(NES)) %>%
+			group_by(ID) %>%
+			mutate(rank = row_number()) %>%
+			ungroup() %>%
+			mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+			left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+
+
+# make heatmap for genes in every enriched pathway
+		heatmap_counts <- compare_long %>%
+				filter(ID %in% modules) %>%
+								# normalize by week 0
+				group_by(Animal, core_enrichment) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				filter(Week_post_FHT != 0) %>%
+				ggplot( aes(x=Animal, y=hs_homolog_ensm, fill=counts)) +
+				  facet_nested(str_wrap(ID,20)~Week_post_FHT + Treatment, scales = "free", space="free_y") +
+				  geom_tile() +
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				scale_fill_gradient2(midpoint = 0, mid = "white", high = "red", low = "blue",
+							   limits = c(-2, 2),
+
+							  breaks = c(2,1,0,-1,-2), oob = scales::squish,
+							  labels = c("2 Upregulated","1", "0", "-1", "-2 Downregulated")) +
+				scale_fill_gradientn(colours = c("blue", "white", "red"),
+									 limits = c(-2, 2),
+									 values = scales::rescale(c(-2, -0.5,0, 0.5,2)),
+									 oob = scales::squish,
+									 breaks = c(-2, -1, 0, 1, 2),
+									 labels = c("-2 Downregulated", "-1", " 0", " 1", " 2 Upregulated")) +
+				theme_minimal() +
+				theme(axis.text.x=element_blank(), axis.ticks=element_blank()) +
+
+				labs(
+				     x = "Animals",
+					 y = "Human ortholog genes", fill=expression(paste(Delta, "Expression level")))
+
+
+heatmap_counts
+
+ggsave("results/plot/03_GSEA/GSEA_heatmap_selected_modules.pdf", heatmap_counts, width = 10, height = 10, dpi = 600)
+# save rds
+saveRDS(heatmap_counts, "results/plot/03_GSEA/GSEA_heatmap_selected_modules.rds")
+```
+
+
+heatmap from hallmark and btm
+```{r}
+modules <- c("enriched in NK cells (I)", "T cell activation (I)", "HALLMARK_HEME_METABOLISM", "HALLMARK_INTERFERON_ALPHA_RESPONSE", "HALLMARK_INTERFERON_GAMMA_RESPONSE", "enriched in activated dendritic cells (II)")
+pathways_to_keep <- c("enriched in NK cells(I)(B)", "T cell activation(I)(B)", "heme metabolism(H)", "interferon alpha response(H)",
+					  "interferon gamma response(H)", "enriched in activated dendritic cells(II)(B)")
+
+
+# vsd and compare_data_gsea_btm
+vsd <- vst(dds, blind=FALSE)
+	# make dataframe with counts
+vsd <- assay(vsd)
+vsd_long <- t(scale(t(vsd))) %>% as.data.frame() %>%
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample") %>%
+			left_join(trans_table, by = c("Gene" = "ensembl_gene_id"), relationship = "many-to-many")
+
+
+compare_long <- dotplot_data %>%
+				as.data.frame() %>%
+			separate_rows(core_enrichment, sep = "/") %>%
+			arrange(ID, desc(NES)) %>%
+			group_by(ID) %>%
+			mutate(rank = row_number()) %>%
+			ungroup() %>%
+			mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+			left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+# save the table in excel
+write.xlsx(compare_long, "results/tables/GSEA_heatmap_input.xlsx")
+
+str_wrap_factor <- function(x, ...) {
+  levels(x) <- str_wrap(levels(x), ...)
+  x
+}
+# make heatmap for genes in every enriched pathway
+		heatmap_counts <- compare_long %>%
+				filter(ID %in% modules) %>%
+				# order ID
+				mutate(ID= ifelse(grepl("HALLMARK", ID),
+                     paste0((tolower(gsub("HALLMARK_", "", ID))), "(H)"),
+                     paste0(ID, "(B)"))) %>%
+				mutate(ID = gsub("_", " ", ID)) %>% # replace spaces with underscore
+				mutate(ID = gsub(" \\(I", "(I", ID)) %>%
+				mutate(ID = factor(ID, levels = pathways_to_keep)) %>%
+
+								# normalize by week 0
+				group_by(Animal, core_enrichment) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				filter(Week_post_FHT != 0) %>%
+				ggplot( aes(x=Animal, y=hs_homolog_ensm, fill=counts)) +
+				facet_nested(str_wrap_factor(ID,24)~factor(Treatment, levels = c("Placebo", "E2")) + Week_post_FHT , scales = "free", space="free_y") +
+				geom_tile() +
+				scale_fill_gradient2(midpoint = 0, mid = "white", high = "red", low = "blue",
+							   limits = c(-2, 2),
+
+							  breaks = c(2,1,0,-1,-2), oob = scales::squish,
+							  labels = c("2 Upregulated","1", "0", "-1", "-2 Downregulated")) +
+				scale_fill_gradientn(colours = c("blue", "white", "red"),
+									 limits = c(-2, 2),
+									 values = scales::rescale(c(-2, -0.5,0, 0.5,2)),
+									 oob = scales::squish,
+									 breaks = c(-2, -1, 0, 1, 2),
+									 labels = c("-2", "-1", " 0", " 1", " 2")) +
+				theme_minimal() +
+				theme(axis.text.x=element_blank(),
+				      panel.spacing.x = unit(c(rep(0.2, 5), 0.7,rep(0.2,5)), "cm")) +
+				labs(
+				     x = "Animals",
+					 y = "Human ortholog genes", fill=expression(paste(Delta, "Expression (vst)")))
+
+
+heatmap_counts
+
+ggsave("results/plot/03_GSEA/GSEA_heatmap_selected_modules.pdf", heatmap_counts, width = 10, height = 10, dpi = 600)
+# save rds
+saveRDS(heatmap_counts, "results/plot/03_GSEA/GSEA_heatmap_selected_modules.rds")
+```
+
+make y axis separately
+
+```{r}
+
+HEME_metab <- c("ALAS2", "FECH", "HMBS", "UROS", "EPOR", "GATA1", "SLC25A37" )
+act_dendritic <- c("SIGLEC1", "BCL2A1","IFIT1")
+NK <- c("GZMB", "PRF1", "EOMES", "KLRK1", "CD96")
+IFNa <- c("IRF7", "STAT2", "ISG15", "MX1", "OAS1", "DDX60", "IFI27", "TRIM25")
+IFNg <- c("IRF1", "STAT1", "CIITA", "HLA-DMB", "CASP1, CXCL10", "IDO1", "SOCS1")
+Tc_activ <- c("BCL11B", "CCL5", "CCR7", "CD28", "CD3D", "CD8", "EOMES", "GATA3", "LCK", "ICOS", "IL7R")
+
+HEME_metab <- c("ALAS2", "FECH", "HBA1_2", "HMBS", "EPOR", "GATA1", "SLC25A37", "TFRC", "UROS", "SLC25A38")
+act_dendritic <- c("SIGLEC1", "BCL2A1","IFIT1")
+NK <- c("GZMB", "PRF1", "CD96")
+IFNa <- c("IRF7", "STAT2", "ISG15", "DDX60", "TRIM25")
+IFNg <- c( "HLA-DMB", "CASP1, CXCL10", "IDO1", "SOCS1")
+Tc_activ <- c("CCL5", "CD3D", "GATA3","IL7R")
+# genes_to_highlight <- c("PRF1", "CCL5", "CD3E", "ZAP70", "GZMB", "CXCL10", "IL1B", "IRF2", "TRIM5", "STAT2")
+genes_to_highlight <- c(HEME_metab, act_dendritic, NK,  IFNa, IFNg, Tc_activ)
+
+heatmap_axis <- heatmap_counts$data %>%
+		filter(Week_post_FHT =="7", Treatment=="E2", Animal == "Rh-11") %>%
+		dplyr::select(hs_homolog_ensm, ID, Treatment, Week_post_FHT) %>%
+		ungroup() %>%
+		unique() %>%
+		mutate(gene_label = ifelse(hs_homolog_ensm %in% genes_to_highlight, hs_homolog_ensm, "")) %>%
+			ggplot(aes(y=hs_homolog_ensm, x=0.1, label=gene_label)) +
+			geom_text_repel(min.segment.length = 0, segment.color = "black", segment.size = 0.1,
+							position= position_nudge_to(x=0),
+							max.overlaps = Inf, label.padding = 0.1, box.padding = 0.1,
+							size = 1.75,
+							direction = "y",
+							segment.curvature = -1e-20, segment.ncp = 5, inflect = T,
+							   force_pull = 2, force = 2, hjust="left",
+							 max.iter =10e4,
+			                color="black") +
+		coord_cartesian(clip="off") +
+				facet_nested(str_wrap_factor(ID,24)~factor(Treatment, levels = c("Placebo", "E2")) + Week_post_FHT ,
+							 scales = "free", space="free_y") +
+			scale_x_continuous(limits = c(0, 0.1), expand = c(0, 0),
+                     breaks = NULL, labels = NULL, name = NULL) +
+  			scale_y_discrete( expand = c(0, 0),
+                     breaks = NULL, labels = NULL, name = "Human ortholog genes") +
+			theme(panel.background = element_blank(),
+		      plot.margin = margin(0,0,0,0, "cm"),
+			strip.background = element_blank(), strip.text = element_blank())
+heatmap_axis
+saveRDS(heatmap_axis, "results/plot/03_GSEA/GSEA_heatmap_axis.rds")
+```
+
+now combine the two plots
+
+```{r}
+
+heatmap_counts <- heatmap_counts +
+		geom_vline(data = heatmap_counts$data %>% filter( Treatment== "E2", Week_post_FHT %in% c("18","19")),
+				   aes(xintercept = 6), linetype = "dashed") +
+		geom_vline(data = heatmap_counts$data %>% filter( Treatment== "Placebo", Week_post_FHT %in% c("18","19")),
+				   aes(xintercept = 7.2), linetype = "dashed") +
+		coord_cartesian(clip="off") +
+  		theme(strip.text.y = element_text(size = 7), # ID labels
+			  strip.text.x = element_text(size = 10), # Treatment labels and week post FHT
+			  ggh4x.facet.nestline = element_line(color = "black", size = 0.5),
+			  axis.text.y.left = element_blank(), # remove gene labels
+			  axis.title.y = element_blank(),
+			  strip.text.y.right = element_text(angle = 0),
+			  axis.ticks = element_blank(), axis.ticks.length = - unit(3, "in"),
+			  panel.spacing.y = unit(0.04, "in"),
+				legend.text =element_text(size=5),
+		legend.title = element_text(size=7)) +
+  scale_y_discrete(labels = function (x) ifelse(x %in% genes_to_highlight, paste0(x, " -"), ""),
+                   expand = c(0,0)) +
+  scale_x_discrete( expand = c(0,0) ) # remove space on the left and right of the labels
+heatmap_comb <- heatmap_axis + heatmap_counts +
+plot_layout(widths= c(1,8)) &
+		coord_cartesian(clip="off") &
+theme(plot.margin = margin(0,0,0,0, "cm"))
+heatmap_comb
+saveRDS(heatmap_comb, "results/plot/03_GSEA/GSEA_heatmap_comb.rds")
+ggsave("results/plot/03_GSEA/GSEA_heatmap_comb.pdf", heatmap_comb, width = 8.5, height = 5, dpi = 600)
+```
+
+
+also get a table that has the core enrichment genes and the human orthologs per geneset
+
+```{r}
+core_enrich_genes <- compare_long %>%
+# only keep significant pathways
+		filter(p.adjust == 0.05) %>% # only significant pathways, I modified the p.adjust to 0.05 (when < 0.05) earlier
+		dplyr::select(Cluster, ID, NES, core_enrichment, hs_homolog_ensm, .sign,) %>%
+		drop_na() %>%
+		unique()
+collapsed_core_enrich_genes <- core_enrich_genes %>%
+		group_by(ID, Cluster) %>%
+		mutate(core_enrichment = paste(core_enrichment, collapse = ", ")) %>%
+		mutate(hs_homolog_ensm = paste(hs_homolog_ensm, collapse = ", ")) %>%
+		mutate(NES = round(NES, 2)) %>%
+		drop_na() %>%
+		ungroup() %>%
+		unique()
+
+collapsed_genesets <- core_enrich_genes %>%
+		dplyr::select(hs_homolog_ensm, ID, Cluster, core_enrichment) %>%
+		unique() %>%
+		group_by(core_enrichment, hs_homolog_ensm) %>%
+		mutate(ID = paste( ID, collapse = ", ")) %>%
+		mutate(Cluster = paste(Cluster, collapse = ", ") ) %>%
+		drop_na() %>%
+		ungroup() %>%
+		unique()
+
+# save both
+write.xlsx(core_enrich_genes, "results/tables/GSEA_core_enrich_genes.xlsx")
+write.xlsx(collapsed_core_enrich_genes, "results/tables/GSEA_collapsed_core_enrich_genes.xlsx")
+write.xlsx(collapsed_genesets, "results/tables/GSEA_collapsed_genesets.xlsx")
+
+
+```
+
+
+make a plot with the genes in the rows and the pathways in the columns  presence /absence
+
+```{r}
+# make a table with the genes in the rows and the pathways in the columns
+# presence /absence
+gene_pathway_table <- core_enrich_genes %>%
+		mutate(present = 1) %>%
+		# spread
+  pivot_wider(names_from = ID, values_from = present, values_fill = list(present = 0))
+
+gene_pathway_plot <- gene_pathway_table %>%
+		pivot_longer(cols = -c(Cluster, NES, core_enrichment, hs_homolog_ensm, .sign), names_to = "ID", values_to = "present") %>%
+		ggplot(aes(x = ID, y = hs_homolog_ensm, fill = as.factor(present))) +
+		geom_tile() +
+		scale_fill_manual(values = c("white", "black")) +
+		theme(axis.text.y = element_text(size=4),
+		      axis.text.x = element_text(angle = 45, hjust=1))
+
+gene_pathway_table
+gene_pathway_plot
+#save table
+write.xlsx(gene_pathway_table, "results/tables/GSEA_gene_pathway_table.xlsx")
+# save plot
+ggsave("results/plot/03_GSEA/GSEA_gene_pathway_table.pdf", gene_pathway_plot, width = 15, height = 20, dpi = 600)
+# save rds
+saveRDS(gene_pathway_plot, "results/plot/03_GSEA/GSEA_gene_pathway_table.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# by week
+Prepare gene lists for every week
+```{r}
+# compare weeks
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[result_names != "Intercept"]
+# with grepl
+result_names <- result_names[grepl("E2.Week", result_names)]
+
+
+gene_weeks <- list()
+for (name in seq_along(result_names)) {
+		# get gene_list
+	res <- results(dds, name=result_names[name])
+	#res <- lfcShrink(dds, coef=result_names[name])
+	gene_list <- res$log2FoldChange
+	names(gene_list) <- rownames(res)
+	#omit NA
+	gene_list <- gene_list[!is.na(gene_list)]
+	# sort
+	gene_list <- sort(gene_list, decreasing = TRUE)
+	# add to list
+	gene_weeks[[paste(result_names[name])]] <- gene_list
+}
+
+
+```
+## msig
+
+run msig by week
+this needs a  lot of correctionst o look more like the btm one
+
+```{r}
+
+
+plot_list <- list()
+gsea_list <- list()
+for (name in seq_along(result_names)) {
+	# get gene_list
+	res <- results(dds, name=result_names[name])
+
+	gene_list <- res$log2FoldChange
+	names(gene_list) <- rownames(res)
+	#omit NA
+	gene_list <- gene_list[!is.na(gene_list)]
+	# sort
+	gene_list <- sort(gene_list, decreasing = TRUE)
+	# run gsea
+	gse_msig <- GSEA(geneList = gene_list,
+				 TERM2GENE = msigdbr_t2g,
+				 pAdjustMethod = "BH",
+				 pvalueCutoff = 0.05,
+				 verbose = FALSE)
+	# if results empty, next
+	if (nrow(gse_msig@result) == 0) {
+		text <- paste("No enriched pathwats for", result_names[name])
+    	no_res_plot <- ggplot() +
+				annotate("text", x = 0.5, y = 0.5, label = text, size = 10)
+		plot_list[[paste(result_names[name])]] <- no_res_plot
+		next
+	}
+	# make dotplot and heatmap per pathway
+	  sample_metadata <- colData(dds) %>% as.data.frame()
+	# get count data joined with metadata
+	vsd <- vst(dds, blind=FALSE)
+	# make dataframe with counts
+	vsd <- assay(vsd)
+	  vsd_long <- vsd %>% as.data.frame() %>% # scale by row
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample")
+
+	gse_msig_long <- gse_msig@result %>%
+				as.data.frame() %>%
+			separate_rows(core_enrichment, sep = "/") %>%
+			arrange(ID, desc(NES)) %>%
+			group_by(ID) %>%
+			mutate(rank = row_number()) %>%
+			ungroup() %>%
+			mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+			left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+	gene_names <- bitr(gse_msig_long$core_enrichment, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = org.Mmu.eg.db)
+	gse_msig_long <- gse_msig_long %>%
+		left_join(gene_names, by = c("core_enrichment" = "ENSEMBL"), relationship = "many-to-many") %>%
+			#if symbol empty/NA, fill with core_enrichment
+			mutate(core_enrichment = ifelse(is.na(SYMBOL), core_enrichment, SYMBOL)) %>%
+		mutate(core_enrichment = SYMBOL)
+
+	# save result table to list
+	gsea_list[[paste(result_names[name])]] <- gse_msig@result
+
+	# make dotplot
+	dotplot <- dotplot(gse_msig, showCategory=10, title="Hallmark", x = "NES", color="NES") +
+						labs(title = result_names[name])
+	# add to plot_list
+	plot_list[[paste(result_names[name])]] <- dotplot
+	# ID list
+	ID_list <- gse_msig_long$ID %>% unique()
+
+	for (pathway in seq_along(ID_list)) {
+
+		# make heatmap
+		heatmap <- gse_msig_long %>%
+				# scale
+				group_by(core_enrichment) %>%
+				mutate(counts = scale(counts)) %>%
+				filter(ID == ID_list[pathway]) %>%
+				# normalize by week 0
+				group_by(Animal, core_enrichment) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				ggplot( aes(x=Animal, y=core_enrichment, fill=counts)) +
+				  facet_nested(ID~Week_post_FHT + Treatment, scales = "free") +
+				  geom_tile() +
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				scale_fill_gradient2(midpoint = 0, mid = "gray", low = "blue", high = "red",
+							  breaks = c(2,-2), labels = c("Upregulated", "Downregulated")) +
+				  theme(axis.text.x=element_text(angle=65, hjust=1), axis.ticks.y=element_blank()) +
+				labs(title = paste0(ID_list[pathway], "-", result_names[name]))
+		# save to list
+		plot_list[[paste(ID_list[pathway], "in", result_names[name])]] <- heatmap
+	}
+}
+# save plotlost to pdf
+pdf("results/plot/03_GSEA/GSEA_hallmark.pdf", width = 20, height = 10)
+plot_list
+dev.off()
+
+```
+
+## btm_plus
+
+```{r}
+
+
+plot_list <- list()
+for (i in seq_along(gene_weeks)) {
+	# get gene_list
+	gene_list <- gene_weeks[[i]]
+	# run gsea
+	gse_btm <- GSEA(geneList = gene_list,
+				 TERM2GENE = btm_plus_mmul_t2g,
+					minGSSize = 5,
+					maxGSSize = 500,
+				 pAdjustMethod = "BH",
+				 pvalueCutoff = 0.05,
+				 verbose = FALSE)
+	# if results empty, next
+	if (nrow(gse_btm@result) == 0) {
+		text <- paste("No enriched pathways for", result_names[name])
+    	no_res_plot <- ggplot() +
+				annotate("text", x = 0.5, y = 0.5, label = text, size = 10)
+		plot_list[[paste(result_names[name])]] <- no_res_plot
+		next
+	}
+	# make dotplot and heatmap per pathway
+	sample_metadata <- colData(dds) %>% as.data.frame()
+	# get count data joined with metadata
+		vsd_long <- vsd %>% as.data.frame() %>%
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample") %>%
+			left_join(trans_table, by = c("Gene" = "ensembl_gene_id"), relationship = "many-to-many")
+	# add gsea results
+	gse_btm_long <- gse_btm@result %>%
+				as.data.frame() %>%
+			separate_rows(core_enrichment, sep = "/") %>%
+			arrange(ID, desc(NES)) %>%
+			group_by(ID) %>%
+			mutate(rank = row_number()) %>%
+			ungroup() %>%
+			mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+			left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+
+	# save result table to list
+	gsea_list[[paste(result_names[i])]] <- gse_btm@result
+
+	# make dotplot
+	dotplot <- dotplot(gse_btm, showCategory=20, title="Blood transcriptional modules", x = "NES", color="NES", label_format = 50) +
+						labs(title = result_names[i])
+	# add to plot_list
+	plot_list <- append(plot_list, list(dotplot))
+	# ID list
+	ID_list <- gse_btm_long$ID %>% unique()
+
+	# make heatmap for genes in every enriched pathway
+	for (pathway in seq_along(ID_list)) {
+		NES <- gse_btm@result[gse_btm@result$ID == ID_list[pathway], "NES"]  %>% round(2)
+		heatmap <- gse_btm_long %>%
+				#scale
+				group_by(core_enrichment) %>%
+				mutate(counts = scale(counts)) %>%
+				filter(ID == ID_list[pathway]) %>%
+								# normalize by week 0
+				group_by(Animal, core_enrichment) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				filter(Week_post_FHT != 0) %>%
+				ggplot( aes(x=Animal, y=hs_homolog_ensm, fill=counts)) +
+				  facet_nested(ID~Week_post_FHT + Treatment, scales = "free") +
+				  geom_tile() +
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				scale_fill_gradient2(midpoint = 0, mid = "white", low = "blue", high = "red",
+							  breaks = c(2,-2), labels = c("Upregulated", "Downregulated"), limits = c(-2,2),
+								oob=scales::squish) +
+				theme(axis.text.x=element_text(angle=65, hjust=1), axis.ticks.y=element_blank()) +
+				labs(x = "Animals",
+					 y = "Human ortholog genes", fill="Expression level\n(normalized by week 0)",
+					 title = paste0("BTM: ", ID_list[pathway], " in ", result_names[i], " NES: ", NES))
+		# save to list
+		plot_list <- append(plot_list, list( heatmap))
+		#plot_list[[paste(ID_list[pathway], "in", result_names[i], " NES:", gse_btm@result[gse_btm@result$ID == ID_list[pathway], "NES")]] <- heatmap
+	}
+}
+
+
+
+
+sample_metadata <- colData(dds) %>% as.data.frame()
+vsd_long <- vsd %>% as.data.frame() %>%
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample") %>%
+			left_join(trans_table, by = c("Gene" = "ensembl_gene_id"), relationship = "many-to-many")
+
+gse_heatmap_list <- function (gene_list, vsd_long, btm_plus_mmul_t2g, res_name) {
+	print(res_name)
+		# run gsea
+	gse_btm <- GSEA(geneList = gene_list,
+				 TERM2GENE = btm_plus_mmul_t2g,
+					minGSSize = 5,
+					maxGSSize = 500,
+				 pAdjustMethod = "BH",
+				 pvalueCutoff = 0.05,
+				 verbose = FALSE)
+	# if results empty, next
+	if (nrow(gse_btm@result) == 0) {
+		text <- paste("No enriched pathways for", res_name)
+    	no_res_plot <- ggplot() +
+				annotate("text", x = 0.5, y = 0.5, label = text, size = 10)
+		return(no_res_plot)
+
+	}
+	# make dotplot and heatmap per pathway
+	# get count data joined with metadata
+
+	# add gsea results
+	gse_btm_long <- gse_btm@result %>%
+				as.data.frame() %>%
+			separate_rows(core_enrichment, sep = "/") %>%
+			arrange(ID, desc(NES)) %>%
+			group_by(ID) %>%
+			mutate(rank = row_number()) %>%
+			ungroup() %>%
+			mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+			left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+
+	# save result table to list
+	gsea_list[[paste(result_names[i])]] <- gse_btm@result
+
+	# make dotplot
+	dotplot <- dotplot(gse_btm, showCategory=20, title="Blood transcriptional modules", x = "NES", color="NES", label_format = 50) +
+						labs(title = res_name)
+	# ID list
+	ID_list <- gse_btm_long$ID %>% unique()
+
+	# make heatmap for genes in every enriched pathway
+	pathway_heatmaps <- lapply(as.list(ID_list), function (x) {
+		pathway <- x
+		NES <- gse_btm@result[gse_btm@result$ID == pathway, "NES"]  %>% round(2)
+		heatmap <- gse_btm_long %>%
+				#scale
+				group_by(core_enrichment) %>%
+				mutate(counts = scale(counts)) %>%
+				filter(ID == pathway) %>%
+								# normalize by week 0
+				group_by(Animal, core_enrichment) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				filter(Week_post_FHT != 0) %>%
+				ggplot( aes(x=Animal, y=hs_homolog_ensm, fill=counts)) +
+				  facet_nested(ID~Week_post_FHT + Treatment, scales = "free") +
+				  geom_tile() +
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				scale_fill_gradient2(midpoint = 0, mid = "white", low = "blue", high = "red",
+							  breaks = c(2,-2), labels = c("Upregulated", "Downregulated"), limits = c(-2,2),
+								oob=scales::squish) +
+				theme(axis.text.x=element_text(angle=65, hjust=1), axis.ticks.y=element_blank()) +
+				labs(x = "Animals",
+					 y = "Human ortholog genes", fill="Expression level\n(normalized by week 0)",
+					 title = paste0("BTM: ", pathway, " in ", res_name, " NES: ", NES))
+		return(heatmap)
+	}
+	)
+	return(c(list(dotplot), pathway_heatmaps))
+}
+
+plot_list <- lapply(seq_along(gene_weeks), function (x) gse_heatmap_list(gene_list = gene_weeks[[x]], vsd_long = vsd_long, btm_plus_mmul_t2g, res_name = names(gene_weeks)[x]))
+pdf("results/plot/03_GSEA/GSEA_btm_plus.pdf", width = 20, height = 10)
+plot_list
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+
+plot_list <- list()
+for (i in seq_along(gene_weeks)) {
+	# get gene_list
+	gene_list <- gene_weeks[[i]]
+	# run gsea
+	gse_btm <- GSEA(geneList = gene_list,
+				 TERM2GENE = btm_plus_mmul_t2g,
+					minGSSize = 5,
+					maxGSSize = 100,
+				 pAdjustMethod = "BH",
+				 pvalueCutoff = 0.05,
+				 verbose = FALSE)
+	# if results empty, next
+	if (nrow(gse_btm@result) == 0) {
+		text <- paste("No enriched pathways for", result_names[name])
+    	no_res_plot <- ggplot() +
+				annotate("text", x = 0.5, y = 0.5, label = text, size = 10)
+		plot_list[[paste(result_names[name])]] <- no_res_plot
+		next
+	}
+	# make dotplot and heatmap per pathway
+	sample_metadata <- colData(dds) %>% as.data.frame()
+	# get count data joined with metadata
+		vsd_long <- vsd %>% as.data.frame() %>%
+		  mutate(Gene = rownames(.)) %>%
+		gather(key = "Sample", value = "counts", -Gene) %>%
+		  left_join(sample_metadata, by = "Sample") %>%
+			left_join(trans_table, by = c("Gene" = "ensembl_gene_id"), relationship = "many-to-many")
+
+
+	# add gsea results
+	gse_btm_long <- btm_plus_mmul_t2g %>%
+				filter(term %in% gse_btm@result$ID) %>% # only significant pathways
+				left_join(gse_btm@result, by = c("term" = "ID")) %>%
+			left_join(vsd_long, by = c("ensembl_gene_id" = "Gene"), relationship = "many-to-many") %>%
+			drop_na(Sample) # drop genes not in the dataset
+
+	#
+	# gse_btm_long <- gse_btm@result %>%
+	# 			as.data.frame() %>%
+	# 		separate_rows(core_enrichment, sep = "/") %>%
+	# 		arrange(ID, desc(NES)) %>%
+	# 		group_by(ID) %>%
+	# 		mutate(rank = row_number()) %>%
+	# 		ungroup() %>%
+	# 		mutate(gene_set = factor(ID, levels = unique(ID))) %>%
+	# 		left_join(vsd_long, by = c("core_enrichment" = "Gene"), relationship = "many-to-many")
+
+	# save result table to list
+	gsea_list[[paste(result_names[i])]] <- gse_btm@result
+
+	# make dotplot
+	dotplot <- dotplot(gse_btm, showCategory=20, title="Blood transcriptional modules", x = "NES", color="NES", label_format = 50) +
+						labs(title = result_names[i])
+	# add to plot_list
+	plot_list <- append(plot_list, list(dotplot))
+	# ID list
+	ID_list <- gse_btm_long$term %>% unique()
+
+	# make heatmap for genes in every enriched pathway
+	for (pathway in seq_along(ID_list)) {
+		NES <- gse_btm@result[gse_btm@result$ID == ID_list[pathway], "NES"]  %>% round(2)
+		heatmap <- gse_btm_long %>%
+				#scale
+				group_by(ensembl_gene_id) %>%
+				mutate(counts = scale(counts)) %>%
+				filter(term == ID_list[pathway]) %>%
+								# normalize by week 0
+				group_by(Animal, ensembl_gene_id) %>%
+				mutate(counts = counts - counts[Week_post_FHT == 0]) %>%
+				filter(Week_post_FHT != 0) %>%
+				ggplot( aes(x=Animal, y=hs_homolog_ensm, fill=counts)) +
+				  facet_nested(term~Week_post_FHT + Treatment, scales = "free") +
+				  geom_tile() +
+				  # geom_text(aes(label = round(counts, 2)), size = 2, color="white") +
+				scale_fill_gradient2(midpoint = 0, mid = "white", low = "blue", high = "red",
+							  breaks = c(2,-2), labels = c("Upregulated", "Downregulated"), limits = c(-2,2),
+								oob=scales::squish) +
+				theme(axis.text.x=element_text(angle=65, hjust=1), axis.ticks.y=element_blank()) +
+				labs(x = "Animals",
+					 y = "Human ortholog genes", fill="Expression level\n(normalized by week 0)",
+					 title = paste0("BTM: ", ID_list[pathway], " in ", result_names[i], " NES: ", NES))
+		# save to list
+		plot_list <- append(plot_list, list( heatmap))
+		#plot_list[[paste(ID_list[pathway], "in", result_names[i], " NES:", gse_btm@result[gse_btm@result$ID == ID_list[pathway], "NES")]] <- heatmap
+	}
+}
+
+pdf("results/plot/03_GSEA/GSEA_btm_plus_all_genes.pdf", width = 20, height = 10)
+plot_list
+dev.off()
+
+```

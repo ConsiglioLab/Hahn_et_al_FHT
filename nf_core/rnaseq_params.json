@@ -1,0 +1,23 @@
+{
+   "config_profile_name": "RNAseq macaque",
+   "config_profile_description": "RNAseq pipeline for nhp project",
+   "outdir": "./results/rnaseq_nhp",
+   "max_cpus": 2,
+   "max_memory": "6.GB",
+   "max_time": "6.h",
+   "input": "/projects/fs1/esfontjo/nhp/data/RNAseq/sample_sheet.csv",
+   "fasta": "/projects/fs1/esfontjo/nhp/data/genome/Macaca_mulatta_genome/Macaca_mulatta.Mmul_10.dna.toplevel.fa.gz",
+   "gtf": "/projects/fs1/esfontjo/nhp/data/genome/Macaca_mulatta_genome/Macaca_mulatta.Mmul_10.110.gtf.gz",
+   "gff": "/projects/fs1/common/nextflow/testFiles/nf-core-rnaseq-3.6/genes.gff.gz",
+   "transcript_fasta": "/projects/fs1/common/nextflow/testFiles/nf-core-rnaseq-3.6/transcriptome.fasta",
+   "pseudo_aligner": "salmon",
+   "save_reference": true,
+   "trimmer": "trimgalore",
+   "aligner": "star_salmon"
+
+}
+process {
+    "withName": "RSEM_PREPAREREFERENCE_GENOME" {
+   "ext.args2": "--genomeSAindexNbases 7",
+    }
+}

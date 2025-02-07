@@ -1,0 +1,98 @@
+---
+title: "Prepare databases"
+output: html_notebook
+---
+```{r}
+library(biomaRt)
+library(tidyverse)
+```
+
+Load databases
+```{r}
+btm_plus_py <- read_tsv("data/GSEA_sets/BTM_plus.tsv")
+# long format
+btm_plus_py_t2g <- btm_plus_py %>%
+  gather(key = "term", value = "gene") %>%
+  filter(!is.na(gene)) # drop NAs that were in the original table
+
+```
+
+make trans_table
+orthologs from ensembl human and mmulatta
+
+```{r}
+# translate biomart table
+ensembl <- useEnsembl(biomart = "genes", dataset = "mmulatta_gene_ensembl", version=111)
+
+# get gene names
+trans_table <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description', "hsapiens_homolog_ensembl_gene",
+									"hsapiens_homolog_associated_gene_name"),
+					 # filters = "with_hsapiens_homolog", values = TRUE,
+               mart = ensembl)
+# View(trans_table)
+# create hs_homolog+ensm gene list
+trans_table$hs_homolog_ensm <- trans_table$hsapiens_homolog_associated_gene_name
+# if empty, fill with ensbl_gene_id
+trans_table$hs_homolog_ensm[trans_table$hs_homolog_ensm == ""] <- trans_table$ensembl_gene_id[trans_table$hs_homolog_ensm == ""]
+
+# if 2 or more mmul ensm id map to the same hsapiens gene, keep track in this column
+trans_table <- trans_table %>%
+				group_by(hs_homolog_ensm) %>%
+				mutate(hs_homolog_ensm_n =as.character(row_number())) %>%
+				mutate(hs_homolog_ensm = ifelse(hs_homolog_ensm_n!="1",  paste0(hs_homolog_ensm, "_", hs_homolog_ensm_n),
+				                                hs_homolog_ensm)) %>%
+				ungroup()
+
+
+
+# save to file
+
+write.table(trans_table, "data/Macaca_mulatta_genome/trans.table.tsv", sep = "\t", row.names = FALSE)
+
+```
+
+# translate gene names
+```{r}
+# merge with btm_plus_py_t2g
+btm_plus_mmul_t2g <- btm_plus_py_t2g %>%
+  left_join(trans_table, by = c("gene" = "hsapiens_homolog_associated_gene_name"),
+            relationship = "many-to-many") %>%
+  dplyr::select(term, ensembl_gene_id) %>%
+    filter(!is.na(ensembl_gene_id)) # drop NAs
+# save to file
+write_tsv(btm_plus_mmul_t2g, "data/GSEA_sets/BTM_plus_mmul_t2g.tsv")
+```
+
+
+# human version
+
+save the human version
+
+```{r}
+write_tsv(btm_plus_py_t2g, "data/GSEA_sets/BTM_plus_hs_t2g.tsv")
+```
+
+with ensembl
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# get gene
+trans_table_hs <- getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description', 'uniprot_gn_id', 'uniprot_gn_symbol') ,
+               mart = ensembl)
+
+# merge with btm_plus_py_t2g
+btm_plus_hs_t2g <- btm_plus_py_t2g %>%
+    left_join(trans_table_hs, by = c("gene" = "external_gene_name"))
+
+# save t2g only ensmbl gene ids
+write_tsv(btm_plus_hs_t2g %>% dplyr::select(term, ensembl_gene_id), "data/GSEA_sets/BTM_plus_hs_ensmbl_t2g.tsv")
+```
+
+```{r}
+# save split gen sets rds
+
+
+btm_plus_hs_gene_sets_ensmbl_id <- split(btm_plus_hs_t2g$ensembl_gene_id, btm_plus_hs_t2g$term)
+saveRDS(btm_plus_hs_gene_sets_ensmbl_id, "data/GSEA_sets/BTM_plus_hs_gene_sets_ensmbl_id.rds")
+```
+

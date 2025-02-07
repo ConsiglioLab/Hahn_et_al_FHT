@@ -1,0 +1,541 @@
+---
+title: "Olink analysis for NHP FHT"
+output: html_notebook
+---
+
+Based on Camila's code
+
+```{r setup, include=FALSE}
+# set root dir for knitr
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+```
+
+
+# Loading
+## load libraries
+```{r}
+library(readxl)
+library(OlinkAnalyze)
+library(stringr)
+library(tidyverse)
+library(reshape2)
+library(MuMIn)
+library(cowplot)
+library(lme4)
+library(ggthemes)
+library(parameters) # this should be installed
+library(emmeans)
+library(patchwork)
+```
+
+## load data
+
+```{r}
+meta <- read_excel("data/olink/Olink sample information.xlsx")
+meta$Sample <- sapply(str_split(meta$SampleID, "-"), "[", 1)
+Olink <- read_NPX(filename = "data/olink/AB00000321_NPX.xlsx")
+
+# some typo in Rh-16 w27, annotated as placebo but must be E2
+meta$Treatment[meta$SampleID %in% "Rh-16-27"] <- "E2"
+```
+
+# Explore data
+
+## Check for missing values
+```{r}
+meta %>%
+  ggplot(aes(x=Week, y=Sample, group=Treatment, color=Treatment)) + geom_point() +
+  scale_x_continuous(breaks = c(0,7,13,18,19,23,27)) +
+  ggtitle("Olink sample information") +
+        facet_grid(rows=vars(Treatment), scales="free_y")
+```
+
+
+### filtering down to only useful samples and information
+
+```{r}
+# cast df
+olink <- Olink[,c(1,5,12)] #Sample ID, Assay (the feature), NPX
+olink <- reshape2::dcast(olink, SampleID ~ factor(Assay, levels = unique(olink$Assay)), fun.aggregate=function(i) mean(i, na.rm=TRUE))
+rownames(olink) <- olink$SampleID
+olink <- olink  %>% filter(SampleID %in% meta$SampleID) #remove plate controls
+olink <- olink[,-1]
+```
+
+### Filtering of PPs with variance
+```{r}
+### Filtering of PPs with variance ###
+#sapply(olink, function(i) sd(i, na.rm=T)/mean(i, na.rm=T) *100) %>% sort()
+#remove for low variation: IL2, IL33, Beta-NGF, LIF, IL-2RB, IL-20, FGF-5, IL-24
+PPvar <- sapply(olink, var) %>% sort()
+PPvar
+olink_var <- olink %>% dplyr::select(names(PPvar[PPvar > 0.1])) #77 PPs
+
+m_olink <- merge(olink_var, meta, by.x="row.names", by.y="SampleID")
+
+m_olink$Treatment <- factor(m_olink$Treatment, levels = c("Placebo", "E2"))
+m_olink$Week <- factor(m_olink$Week)
+
+colnames(m_olink) <- str_remove(colnames(m_olink), "-")
+colnames(m_olink) <- str_remove(colnames(m_olink), " ")
+colnames(m_olink) <- gsub("-","", colnames(m_olink))
+colnames(m_olink)[86] <- "X4EBP1"
+```
+
+# define main function
+```{r}
+run_mem <- function(varlist, dataframe, cov1 = NULL, cov2 = NULL, cov3 = NULL, cov4 = NULL, random_eff) {
+
+  # make list of formulas for each PP
+  MEM_PP <- lapply(varlist, function(x) {
+    # add the specified covariates
+    formula_terms <- c(cov1, cov2, cov3, cov4)
+    formula_terms <- formula_terms[!is.null(formula_terms)]
+    # make formula string
+    formula_str <- paste(x, "~", paste(formula_terms, collapse = "+"), "+", "(1|", random_eff, ")")
+    # run model, if it fails return NULL
+    mod2 <- try(lmer(formula_str, data = dataframe, na.action = na.exclude))
+    if (inherits(mod2, "try-error")) {
+      return(NULL) # return NULL if the model can't be fitted
+    } else {
+      return(mod2) # return the model if it can be fitted
+    }
+  })
+
+  # Model check
+  MEM_PP_1 <- as.list(MEM_PP)
+  MEM_PP_1[sapply(MEM_PP_1, is.null)] <- NULL # remove NULLs, i.e. models that couldn't be fitted
+
+  # analyte
+  Analyte <- lapply(MEM_PP_1, function(f) summary(f)$call[2]) # get the analyte name
+  Analyte <- sapply(str_split(string = Analyte, pattern = "~"), `[`, 1)
+  Analyte <- gsub(pattern = "\\(", replacement = "", Analyte)
+  Analyte <- gsub(pattern = "\\ ", replacement = "", Analyte)
+  Analyte <- Analyte %>% as.data.frame()
+  colnames(Analyte) <- "Analyte"
+
+  # coef
+  coefs <- lapply(MEM_PP_1, function(f) summary(f)$coefficients[,1])
+  coefs <- as.data.frame(do.call(rbind, coefs))
+  colnames(coefs) <- paste("estimate", colnames(coefs),sep="")
+
+  #pvalue
+  pvals <- lapply(MEM_PP_1, function(f) parameters::p_value(f, method = "wald",)[,2])
+  pvals_name <- lapply(MEM_PP_1, function(f) parameters::p_value(f, method = "wald",)[,1])[1] %>% unlist()
+  pvals <- as.data.frame(do.call(rbind, pvals))
+  colnames(pvals) <- paste("pValue_", pvals_name,sep="")
+
+  # Median residuals
+  Amed <- lapply(MEM_PP_1, function(f) summary(f)$residuals) #get residuals
+  Amed_na <- lapply(Amed, function(f) na.exclude(f)) #exclude NAs from residuals
+  Amed_calc <- lapply(Amed_na, function(f) median(f)) #calculate median
+  Amed_calc <- as.data.frame(do.call(rbind, Amed_calc))
+  colnames(Amed_calc) <- "residuals"
+
+  # R^2
+  r2 <- lapply(MEM_PP_1, function(f) r.squaredGLMM(f)[2])
+  r2 <- as.data.frame(do.call(rbind, r2))
+  colnames(r2) <- "Rsq"
+
+  Adf <- cbind(Analyte, Amed_calc, r2, coefs, pvals)
+  return(Adf)
+}
+```
+
+
+# run MEM
+model 4, week:treatment interaction (week as factor)
+```{r}
+
+MEM_PP_4 <- run_mem(varlist = colnames(m_olink)[2:86],
+                    dataframe = m_olink,
+                    cov1 = "Week",
+                    cov2 = "Treatment",
+                    cov3 = "Week*Treatment",
+                    random_eff = "Sample") # animal as random effect
+rownames(MEM_PP_4) <- MEM_PP_4$Analyte
+```
+
+some boundary (singular) fit: see help('isSingular')
+this means that for some analytes the model is not able to fit the data, and the model is singular. This is likely due to the fact that the data is not enough to fit the model. This is a common problem in mixed models, and it is not a problem per se. However, it is important to be aware of this, and to interpret the results with caution.
+
+
+
+## add FDR correction to df: Create new columns with _fdr extension
+
+```{r}
+colnames(MEM_PP_4)
+selected_columns <- MEM_PP_4[, 18:31] # seelct the ones that are pvalues
+pvals_corrected <- lapply(selected_columns, function(col) p.adjust(col, method = "BH"))
+for (i in 1:ncol(selected_columns)) {
+  col_name <- colnames(selected_columns)[i]
+  new_col_name <- paste0(col_name, "_fdr")
+  MEM_PP_4[[new_col_name]] <- pvals_corrected[[i]]
+}
+```
+
+
+## significant analytes
+```{r}
+# Get analyte names for each column with FDR < 0.1
+significant_analytes_list <- lapply(pvals_corrected, function(fdr_values) {
+  analytes <- rownames(selected_columns)[fdr_values <= 0.1]
+  return(analytes)
+})
+
+significant_analytes_list
+significant_analytes_list %>% names()
+
+analytes_time <- significant_analytes_list[2:7] %>% unlist() %>% as.character() %>% unique()
+analytes_E2 <- significant_analytes_list$pValue_TreatmentE2
+analytes_timeE2interaction <- significant_analytes_list[9:14] %>% unlist() %>% as.character() %>% unique()
+
+```
+
+
+
+
+# visualizatoin
+MCP4
+```{r}
+m_olink %>%
+  ggplot(aes(x=Week, y=MCP4)) +
+        geom_boxplot(aes(fill=Treatment), alpha=0.25, position=position_dodge(width=0.75)) +
+                 geom_point(aes(color=Treatment), position = position_dodge(width = 0.75)) +
+  ggtitle("MCP4")
+  #facet_grid(rows=vars(Treatment), scales="free_y")
+```
+
+
+## heatmap for significant time effects:
+```{r}
+m_olink %>% colnames()
+scaled_m_olink <- m_olink
+scaled_m_olink[,2:86] <- sapply(scaled_m_olink[,2:86], scale)
+
+# plot all PP changing with only vaccination timepoints
+estimates_order19 <- MEM_PP_4 %>% filter(Analyte %in% unique(c(significant_analytes_list$pValue_Week19, significant_analytes_list$pValue_Week23, significant_analytes_list$pValue_Week27))) %>% arrange(estimateWeek19) %>% pull(Analyte)
+
+# make plot
+Fig1_vaccine_effects_olink <- scaled_m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample",
+                  unique(c(significant_analytes_list$pValue_Week19, significant_analytes_list$pValue_Week23, significant_analytes_list$pValue_Week27)) ))) %>% #colnames()
+  pivot_longer(cols = 5:54) %>%
+  mutate(name = factor(name, levels = estimates_order19),
+         value = as.numeric(value)) %>%
+  ggplot(aes(x = Sample, y = name, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(x = "Week", y = "Analytes", fill = NULL) +
+  geom_vline(xintercept = 18, linetype = "dashed") +
+  geom_vline(xintercept = 22, linetype = "dashed") +
+  facet_wrap(~Week, ncol = 7) + theme(axis.text.x = element_blank()) + labs(y=NULL)
+```
+
+
+## plot PP changing with week 13
+```{r}
+scaled_m_olink %>%
+  #m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample", significant_analytes_list$pValue_Week13))) %>% #colnames()
+  pivot_longer(cols = 5:30) %>%
+  mutate(value = as.numeric(value)) %>%
+  ggplot(aes(x = Sample, y = name, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(x = "Week", y = "Analytes", fill = NULL) +
+  geom_vline(xintercept = 18, linetype = "dashed") +
+  geom_vline(xintercept = 22, linetype = "dashed") +
+  facet_wrap(~Week, ncol = 7) + theme(axis.text.x = element_blank()) + labs(y=NULL, title = "changing at week 13")
+
+```
+
+
+
+## changes associated to E2 treatment
+
+maybe it is better to do the mean and se per week and treatment, instead of geom_smooth loess
+```{r}
+inter_w18 <- significant_analytes_list$`pValue_Week18:TreatmentE2`
+
+scaled_m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample", inter_w18))) %>% #colnames()
+  pivot_longer(cols = 5:7) %>%
+  ggplot(aes(x=as.numeric(as.character(Week)), y=value, group=as.numeric(as.character(Week)), color=Treatment)) +
+  geom_line(aes(group=Sample)) + theme_classic() + geom_vline(xintercept = 18, linetype="dashed") + geom_vline(xintercept = 22, linetype="dashed") +
+
+        scale_x_continuous(breaks = c(0,7,13,18,19,23,27)) +
+  facet_wrap(~name, ncol=8, scales="free") + labs(y=NULL) +
+  scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+  scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        geom_smooth(aes(group=Treatment, fill=Treatment), method = "loess", se = T, linetype = "dashed", size = 0.5)
+
+inter_vacc <- c(significant_analytes_list$`pValue_Week19:TreatmentE2`, significant_analytes_list$`pValue_Week23:TreatmentE2`)
+
+scaled_m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample", unique(c(inter_w18,inter_vacc)) ))) %>% #colnames()
+  pivot_longer(cols = 5:8) %>%
+  mutate(name=factor(name, levels = c("FGF19", "CCL19", "MCP4", "CST5"))) %>%
+  ggplot(aes(x=as.numeric(as.character(Week)), y=value, group=as.numeric(as.character(Week)), color=Treatment)) +
+  geom_line(aes(group=Sample)) + theme_classic() + geom_vline(xintercept = 18, linetype="dashed") + geom_vline(xintercept = 22, linetype="dashed") +
+  scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+  scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        scale_x_continuous(breaks = c(0,7,13,18,19,23,27)) +
+  facet_wrap(~name, ncol=8, scales="free") + labs(y="scaled NPX", x="Weeks") +
+        geom_smooth(aes(group=Treatment, fill=Treatment), method = "loess", se = T, linetype = "dashed", size = 0.5)
+
+significant_line_plot <- m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample", unique(c(inter_w18,inter_vacc)) ))) %>% #colnames()
+  pivot_longer(cols = 5:8) %>%
+  mutate(name=factor(name, levels = c("FGF19", "CCL19", "MCP4", "CST5"))) %>%
+        # display the change
+        group_by(Sample, name) %>%
+        mutate(value = value- value[Week == 0]) %>%
+        # calculate mean and sd per treatment
+    group_by(Treatment, name, Week) %>%
+        mutate(mean_value = mean(value, na.rm = T), sd_value = sd(value, na.rm = T)) %>% ungroup() %>%
+
+         ggplot(aes(x=as.numeric(as.character(Week)), y=mean_value,  color=Treatment)) +
+        geom_line(aes(group=Sample, y =value)) + theme_classic() +
+        geom_vline(xintercept = c(18, 22), linetype="dashed") +
+        scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+  scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        scale_x_continuous(breaks = c(0,7,13,18,19,23,27), labels = c("0", "7", "13", "", "19", "23", "27")) +
+  facet_wrap(~name, ncol=8) +
+        labs(y= expression(paste(Delta, "NPX")), x="Weeks") +
+geom_ribbon(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value, fill=Treatment, color=NULL), alpha = 0.2) +
+        theme_minimal() +
+		theme(panel.grid.minor = element_blank())
+
+
+significant_analytes_list
+significant_line_plot
+# save plot
+ggsave("results/plot/olink/significant_line_plot.pdf", significant_line_plot, width = 13, height = 2.5)
+```
+
+
+## visualize MEM results
+```{r}
+sigprots <- unique(c(MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week7:TreatmentE2` <= 0.05],
+                     MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week13:TreatmentE2` <= 0.05],
+                     MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week18:TreatmentE2` <= 0.05],
+                     MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week19:TreatmentE2` <= 0.05],
+                     MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week23:TreatmentE2` <= 0.05],
+                     MEM_PP_4$Analyte[MEM_PP_4$`pValue_Week27:TreatmentE2` <= 0.05]
+))
+memplotorder <- MEM_PP_4 %>% filter(Analyte %in% sigprots) %>% arrange(`estimateWeek18:TreatmentE2`) #%>% pull(Analyte)
+memplotorder$`pValue_Week7:TreatmentE2_fdr`
+
+```
+```{r}
+A <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek7:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week7:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek7:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 7")  + theme_classic() + theme(legend.position = "none")#+ guides(color=guide_legend(title="FDR<0.1")) #+
+
+B <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek13:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week13:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek13:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 13")  + theme_classic() + theme(legend.position = "none")#+ guides(color=guide_legend(title="FDR<0.1")) #+
+
+C <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek18:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week18:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek18:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 18")  + theme_classic() + theme(legend.position = "none")#+ guides(color=guide_legend(title="FDR<0.1")) #+
+
+D <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek19:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week19:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek19:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 19")  + theme_classic() + theme(legend.position = "none") #+ guides(color=guide_legend(title="FDR<0.1")) #+
+
+E <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek23:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week23:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek23:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 23", color="FDR<0.1")  + theme_classic() + theme(legend.position = "none") #+ guides(color=guide_legend(title="FDR<0.1")) #+
+
+G <- memplotorder %>%
+  mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+  ggplot(aes(x=`estimateWeek27:TreatmentE2`, y=Analyte)) +
+  geom_point(aes(color= `pValue_Week27:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek27:TreatmentE2`))) + #
+  geom_vline(xintercept = 0, alpha=0.3, linetype="dotted") + scale_color_manual(values = c("gray", "red")) + scale_x_continuous(limits = c(-3, 3)) +
+  labs(x="Estimate", y=NULL, size=NULL, title = "Week 27")  + theme_classic() + theme(legend.position = "none") #+ guides(color=guide_legend(title="FDR<0.1")) #+
+legend <- get_legend(memplotorder %>%
+                       mutate(Analyte=factor(Analyte, levels = memplotorder$Analyte)) %>%
+                       ggplot(aes(x=`estimateWeek23:TreatmentE2`, y=Analyte)) +
+                       geom_point(aes(color= `pValue_Week23:TreatmentE2_fdr`<=0.1, size=abs(`estimateWeek23:TreatmentE2`))) + #
+                       scale_color_manual(values = c("gray", "red")) +
+                       labs(x=NULL, y=NULL, size="Estimate", title = "Week 23", color="FDR<0.1")  + theme_classic() ) # + theme(legend.box.margin = margin(0, 0, 0, 12))  create some space to the left of the legend
+
+MEM_res <- plot_grid(A,B,C,D,E,G,legend, ncol=7)
+MEM_res
+```
+
+
+# models with CI
+
+```{r}
+# run model for every assay
+assay_models <- m_olink %>%
+# make long format
+pivot_longer(cols = 2:86, names_to = "Assay", values_to="NPX") %>%
+mutate(Assay = as.factor(Assay),
+       NPX = as.numeric(NPX),
+       Sample = as.factor(Sample),
+       Treatment = as.factor(Treatment),
+       Week = as.factor(Week)) %>%
+        ungroup() %>%
+group_by(Assay) %>%
+summarise(model = list(lmer(NPX ~ Week*Treatment + (1|Sample),
+          data=pick(everything()))))
+
+
+```
+
+confint
+
+```{r}
+# get the confidence intervals
+assay_interaction <- assay_models %>%
+        ungroup() %>%
+rowwise(Assay) %>%
+reframe(emmeans(model,  ~ Week*Treatment)  %>%
+                contrast(interaction = c("pairwise", "pairwise"), adjust = "none", infer = TRUE) %>% as_tibble())  %>%
+# filter the ones we need
+filter(grepl("0 -", Week_pairwise))
+
+```
+
+adjust p_values
+```{r}
+assay_interaction <- assay_interaction %>%
+        # adjusted per contrast
+        group_by(Week_pairwise) %>%
+mutate(p.adj = p.adjust(p.value, method = "fdr"))
+```
+
+## significant
+
+fdr
+```{r}
+assay_interaction %>%
+        filter(p.adj < 0.1)
+```
+
+## visualize
+
+plot with effect sizes and confidence intervals
+```{r}
+
+# arrange by week 18
+interaction_data_order <- assay_interaction %>%
+        filter(Assay %in% assay_interaction$Assay[assay_interaction$p.value < 0.05]) %>%
+        select(Assay, Week_pairwise, estimate) %>%
+        pivot_wider(names_from = Week_pairwise, values_from = estimate) %>%
+        arrange(`0 - 18`)
+
+interaction_plot <- assay_interaction %>%
+        filter(Assay %in% assay_interaction$Assay[assay_interaction$p.value < 0.05]) %>%
+        mutate(Assay = factor(Assay, levels = interaction_data_order$Assay)) %>%
+        ggplot(aes(x=estimate, y= Assay, color=p.adj <0.1)) +
+        geom_errorbar(aes(xmin = lower.CL, xmax = upper.CL), width = 0.1) +
+        geom_point(aes(size=abs(estimate))) +
+        geom_vline(xintercept = 0, linetype = "twodash") +
+        scale_color_manual(values = c("gray", "red")) +
+        # limit of size
+        scale_size_continuous(breaks = c(0.5, 1,  2), range = c(1, 5)) +
+        theme_classic() +
+        labs(x="Estimate", y=NULL, color="FDR<0.1",
+             size = "Estimate size",
+             title = "Estrogen treatments effects on serum inflammatory proteins",
+        subtitle = "Mean estimate and 95% CI") +
+        facet_wrap(~Week_pairwise,  nrow=1)
+
+interaction_plot
+```
+
+heatmap of results
+
+```{r}
+ interaction_heatmap <- assay_interaction %>%
+        filter(Assay %in% assay_interaction$Assay[assay_interaction$p.value < 0.05]) %>%
+        mutate(Assay = factor(Assay, levels = interaction_data_order$Assay)) %>%
+        ggplot(aes(x=Week_pairwise, y= Assay, fill = (lower.CL >0 | upper.CL <0 ))) +
+        geom_tile() +
+        geom_text(aes(label = paste(round(lower.CL,2), round(upper.CL, 2))), size = 4)
+interaction_heatmap
+
+```
+
+
+# create main figure
+
+```{r}
+design <- "
+A
+A
+A
+A
+A
+A
+A
+B
+B
+B
+"
+main_figure <- interaction_plot   / significant_line_plot  +
+        plot_layout(design = design) +
+        plot_annotation(tag_levels = "A")  &
+        theme_minimal() +
+        theme(strip.background.x = element_rect(fill = "#f7f4ed", color="white"))
+main_figure
+
+# save
+ggsave("results/plot/olink/olink_main_figure.pdf", main_figure, width = 10, height = 10)
+```
+
+
+# vertical version of lineplot
+
+```{r}
+vertical_significant_line_plot <- m_olink %>%
+  select(all_of(c("Row.names", "Treatment", "Week", "Sample", unique(c(inter_w18,inter_vacc)) ))) %>% #colnames()
+  pivot_longer(cols = 5:8) %>%
+  mutate(name=factor(name, levels = c("FGF19", "CCL19", "MCP4", "CST5"))) %>%
+        # display the change
+        group_by(Sample, name) %>%
+        mutate(value = value- value[Week == 0]) %>%
+        # calculate mean and sd per treatment
+    group_by(Treatment, name, Week) %>%
+        mutate(mean_value = mean(value, na.rm = T), sd_value = sd(value, na.rm = T)) %>% ungroup() %>%
+
+         ggplot(aes(x=as.numeric(as.character(Week)), y=mean_value,  color=Treatment)) +
+        geom_line(aes(group=Sample, y =value)) + theme_classic() +
+        geom_vline(xintercept = c(18, 22), linetype="dashed") +
+        scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+  scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        scale_x_continuous(breaks = c(0,7,13,18,19,23,27), labels = c("0", "7", "13", "", "19", "23", "27")) +
+  facet_wrap(~name, ncol=2) +
+        labs(y= expression(paste(Delta, "NPX")), x="Weeks") +
+geom_ribbon(aes(ymin = mean_value - sd_value, ymax = mean_value + sd_value, fill=Treatment, color=NULL), alpha = 0.2) +
+        theme_minimal() +
+		theme(panel.grid.minor = element_blank(),strip.background.x = element_rect(fill = "#f7f4ed", color="white"),
+        strip.text.x.top = element_text(size = 22, face = "bold"))
+
+# save
+ggsave("results/plot/olink/significant_line_plot_vertical.pdf", vertical_significant_line_plot, width = 10, height = 10)
+significant_line_plot
+```

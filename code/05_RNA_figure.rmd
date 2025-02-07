@@ -1,0 +1,183 @@
+---
+title: "Main figure"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = dirname(getwd()))
+```
+
+load libraries
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(stringr)
+library(ggrepel)
+library(ggpp)
+
+```
+
+load figure objects
+```{r}
+dotplot_GSEA <- readRDS("results/plot/03_GSEA/GSEA_dotplot_all_db.rds")
+line_plot_btm_plus <- readRDS("results/plot/04_ssGSEA/ssGSEA_lineplot_all.rds")
+line_plot_hallmark <- readRDS("results/plot/04_ssGSEA/ssGSEA_lineplot_hallmark_all.rds")
+line_plot_comb <- readRDS("results/plot/04_ssGSEA/ssGSEA_lineplot_comb.rds")
+heatmap_counts <- readRDS("results/plot/03_GSEA/GSEA_heatmap_selected_modules.rds")
+heatmap_comb <- readRDS("results/plot/03_GSEA/GSEA_heatmap_comb.rds")
+heatmap_axis <- readRDS("results/plot/03_GSEA/GSEA_heatmap_axis.rds")
+```
+
+filter line plots
+```{r}
+pathways_to_keep <- c("enriched in NK cells(I)(B)", "T cell activation(I)(B)", "heme metabolism(H)",
+					  "interferon alpha response(H)", "interferon gamma response(H)", "enriched in activated dendritic cells(II)(B)")
+
+line_plot_comb$data <- line_plot_comb$data %>% filter(module %in% pathways_to_keep) %>%
+		# reorder modules
+		mutate(module = factor(module, levels = pathways_to_keep))
+
+```
+
+
+calculate ylims
+```{r}
+data <- rbind(line_plot_btm_plus$data, line_plot_hallmark$data)
+max_score <- max(abs(c(data$mean_score + data$sd_score, data$mean_score - data$sd_score)), na.rm = T)
+
+```
+
+
+
+
+```{r}
+
+design <-"
+AAAAAACC
+AAAAAACC
+AAAAAACC
+AAAAAACC
+AAAAAACC
+BBBBBBCC
+DDDDDDDD
+DDDDDDDD
+DDDDDDDD
+DDDDDDDD
+DDDDDDDD
+"
+
+HEME_metab <- c("ALAS2", "FECH", "HMBS", "UROS", "EPOR", "GATA1", "SLC25A37")
+act_dendritic <- c("SIGLEC1", "BCL2A1","IFIT1")
+NK <- c("GZMB", "PRF1", "EOMES", "KLRK1", "CD96")
+IFNa <- c("IRF7", "STAT2", "ISG15", "MX1", "OAS1", "DDX60", "IFI27", "TRIM25")
+IFNg <- c("IRF1", "STAT1", "CIITA", "HLA-DMB", "CASP1, CXCL10", "IDO1", "SOCS1")
+Tc_activ <- c("BCL11B", "CCL5", "CCR7", "CD28", "CD3D", "CD8", "EOMES", "GATA3", "LCK", "ICOS", "IL7R")
+
+HEME_metab <- c("ALAS2", "HMBS", "UROS", "EPOR", "GATA1", "SLC25A37")
+act_dendritic <- c("SIGLEC1", "BCL2A1","IFIT1")
+NK <- c("GZMB", "PRF1", "CD96")
+IFNa <- c("IRF7", "STAT2", "ISG15", "DDX60", "TRIM25")
+IFNg <- c( "HLA-DMB", "CASP1, CXCL10", "IDO1", "SOCS1")
+Tc_activ <- c("CCL5", "CD3D", "GATA3","IL7R")
+# genes_to_highlight <- c("PRF1", "CCL5", "CD3E", "ZAP70", "GZMB", "CXCL10", "IL1B", "IRF2", "TRIM5", "STAT2")
+genes_to_highlight <- c(HEME_metab, act_dendritic, NK,  IFNa, IFNg, Tc_activ)
+
+
+# max score from line_plot_comb
+
+max_score <- max(abs(c(line_plot_comb$data$mean_score + line_plot_comb$data$sd_score, line_plot_comb$data$mean_score - line_plot_comb$data$sd_score)), na.rm = T)
+
+str_wrap_factor <- function(x, ...) {
+  levels(x) <- str_wrap(levels(x), ...)
+  x
+}
+line_plot_comb <- line_plot_comb +
+  ylim(-max_score, max_score) +
+  guides(fill = guide_legend(ncol=2)) +
+  facet_wrap(~str_wrap_factor(module, 30),
+			 ncol=2, dir = "v") + # first fill the columns
+  scale_x_continuous(breaks = c(0,7,13,18,19,23,27),
+                     labels = c("0", "7", "13", "18", "", "23", "27") ) +
+		theme(panel.spacing.y = unit(0.00, "in"),
+			  strip.clip = "off",
+			  axis.text = element_text(size = 7),
+			  strip.text =  element_text(size = 7),
+			  legend.text = element_text(size = 8),
+			  legend.title = element_text(size = 8),
+			  legend.box.spacing = unit(0.01, "in"),
+			  legend.box.margin = margin(0,0,0,0),
+		      legend.position = "bottom")
+
+heatmap_legend <- ggplot() + theme_void() + cowplot::get_legend(heatmap_comb)
+heatmap_counts <- heatmap_counts +
+		geom_vline(data = heatmap_counts$data %>% filter( Treatment== "E2", Week_post_FHT %in% c("18","19")),
+				   aes(xintercept = 6), linetype = "dashed") +
+		geom_vline(data = heatmap_counts$data %>% filter( Treatment== "Placebo", Week_post_FHT %in% c("18","19")),
+				   aes(xintercept = 7.2), linetype = "dashed") +
+		coord_cartesian(clip="off") +
+guides(fill="none") +
+theme(strip.text.y = element_text(size = 7), # ID labels
+			  strip.text.x = element_text(size = 10), # Treatment labels and week post FHT
+			  ggh4x.facet.nestline = element_line(color = "black", size = 0.5),
+			  axis.text.y.left = element_blank(), # remove gene labels
+			  axis.title.y = element_blank(),
+			  strip.text.y.right = element_text(angle = 0),
+			  axis.ticks = element_blank(), axis.ticks.length = - unit(3, "in"),
+			  panel.spacing.y = unit(0.04, "in")) +
+  scale_y_discrete(labels = function (x) ifelse(x %in% genes_to_highlight, paste0(x, " -"), ""),
+                   expand = c(0,0)) +
+  scale_x_discrete( expand = c(0,0) ) # remove space on the left and right of the labels
+# extract only the legend from the plot
+
+
+dotplot_GSEA <- dotplot_GSEA +
+				continuous_scale("stroke", "stroke",
+                 palette = scales::rescale_pal(c(0, 2.5)),
+                 breaks = c(-2, -1,-0.5 ,0.5, 1.0, 2.0)) +
+		guides(color=guide_legend(override.aes = list(shape=19, stroke=c(2.5,1.25,0,1.25,2.5),
+													  color=c("#8B0000","#A77878", "#B6B6B6", "#7878A7", "#00008B"))),
+		       stroke="none",
+				shape=guide_legend(override.aes = list(stroke=1.5))) +
+		theme(legend.box = "vertical",
+			  legend.direction = "vertical",
+			  legend.position = "right",
+			  legend.text = element_text(size = 7), legend.title = element_text(size = 5),
+			  axis.text.y = element_text(size = 5),
+			  strip.text = element_text(margin=margin(0,0,0,0), size = 7),
+			  strip.text.x =element_blank(),
+			  plot.title.position = "plot",
+			  plot.title = element_text(hjust = 0.5),
+		      plot.margin = margin(r=0))
+
+
+layout <- c(
+		  area(1, 2, 11, 7),
+		  #area(1, 9, 2, 20),
+		  area(1, 8, 11, 20),
+		  #area(7, 1, 11, 1),
+		  #area(7, 2, 11, 9),
+		  #area(7, 10, 11, 10)
+		  area(12, 2, 22, 20)
+)
+figure_RNA <-dotplot_GSEA + theme(plot.margin = margin(b=0),
+                                  plot.tag.position = c(0.03,0.97)) + labs(tag="A") +
+		#guide_area()+
+		free(wrap_elements(line_plot_comb + labs(tag = "B")  + theme(plot.tag.position = c(0.025,0.97)), clip=F))  +
+		free(wrap_elements(heatmap_comb + labs(y="Human ortholog genes", tag="C") + theme(plot.margin = margin(t=0, b=0, r=0, l=0),
+		      plot.tag.position = c(-.07,0.97)), clip = F) )   +
+		#inset_element(wrap_plots(heatmap_comb, guides="keep"), 1,10,1,7)+
+        plot_layout(design = layout, axes="collect")  &
+        theme(#legend.key.spacing = unit(0.05, "in"),
+			 # legend.box = "horizontal",
+			 # legend.spacing = unit(0.01, "in"),
+			  legend.text = element_text(size = 7),
+#			  plot.background = element_rect(fill = "red"),
+			  legend.title = element_text(size = 8))
+
+
+ggsave("results/plot/05_main_figure/figure_RNA.pdf", figure_RNA, width = 8.5, height = 11, units = "in")
+```
+
+

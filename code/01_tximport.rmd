@@ -1,0 +1,173 @@
+---
+title: "Importing salmon files"
+output:
+  html_document:
+    output_dir: "knits/"
+---
+
+Importing salmon files via tximport.
+
+
+Following:
+https://bioconductor.org/packages/devel/bioc/vignettes/tximport/inst/doc/tximport.html#Salmon
+
+First set the root directory as the working directory.
+By default getwd() is the directory of the markdown file.
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = dirname(getwd()))
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tximport)
+library(DESeq2)
+library(AnnotationDbi)
+library(org.Mmu.eg.db)
+library(dplyr)
+```
+
+
+# Load data
+Load sample information
+
+```{r}
+sample_full <- read.table("data/metadata_processed/sample_full.txt", header = TRUE, sep = "\t")
+sample_full
+```
+load files
+```{r}
+dir_salmon <- "data/salmon_quant_files"
+list.files(dir_salmon)
+# check that the files are there
+all(file.exists(file.path(dir_salmon, sample_full$sample_id, "-quant.sf")))
+```
+
+
+Check files
+```{r}
+sf_files <- list.files(dir_salmon)
+
+# make file path
+sf_files <- file.path(dir_salmon, sf_files)
+all(file.exists(sf_files))
+
+# add samples as names
+sf_names <- sub("-quant.sf", "",
+                basename(sf_files) # only the file name
+) # remove the suffix
+names(sf_files) <- sf_names
+
+```
+
+Create tx2gene file
+It is version Mmul_10
+Script is make_tx2gene_Mmul_gtf.sh
+
+Import tx2gene file
+```{r}
+tx2gene <- read.table("data/Macaca_mulatta_genome/tx2gene_ensembl_Macaca_mulatta_genome.txt", header = FALSE,sep = "\t")
+head(tx2gene)
+```
+
+Import files through tximport
+```{r}
+txi_salmon <- tximport(sf_files, type = "salmon",
+                       geneIdCol = "Name",
+                       lengthCol = "Length",
+                       abundanceCol = "TPM",
+                       countsCol = "NumReads",
+                       tx2gene = tx2gene,
+                       countsFromAbundance = "lengthScaledTPM" # corrected by transcript length over samples and library size.
+)
+names(txi_salmon)
+```
+
+# create DESeq2 data
+we use the txi_salmon$counts as a matrix, because it has already been scaled
+```{r}
+# order sample_full according to txi_salmon counts
+sample_full <- sample_full[match(colnames(txi_salmon$counts), sample_full$Sample),]
+# check
+all(sample_full$Sample %in% colnames(txi_salmon$counts)) # columns exist
+all(sample_full$Sample == colnames(txi_salmon$counts)) #same order
+
+```
+
+## Add metadata
+add Animal.n to sample_full
+```{r}
+sample_full %>%
+distinct(Animal, Treatment) %>%
+		group_by(Treatment) %>%
+mutate(Animal.n = row_number()) %>%
+		ungroup() %>%
+		dplyr::select(Animal, Animal.n) %>%
+right_join(sample_full, by = "Animal") -> sample_metadata
+
+```
+make factor levels, and reference
+```{r}
+# all factors
+sample_metadata %>%
+		mutate_all(as.factor) %>%
+        # relevel - to choose which are the reference levels
+        mutate(Treatment = relevel(Treatment, ref = "Placebo"),
+                        Week_post_FHT = relevel(Week_post_FHT, ref = "0") ) -> sample_metadata
+str(sample_metadata)
+
+```
+ ## remove outlier
+This is based on the PCA and correlation matrix generated from the nf-core RNA-seq pipeline, v3.9.
+```{r}
+sample_metadata <- sample_metadata %>%
+filter(Sample != "G21")
+# filter from txi_salmon
+txi_salmon$counts <- txi_salmon$counts[,sample_metadata$Sample]
+# for abundance
+txi_salmon$abundance <- txi_salmon$abundance[,sample_metadata$Sample]
+# and for length
+txi_salmon$length <- txi_salmon$length[,sample_metadata$Sample]
+```
+
+
+## create DESeq2 object
+```{r}
+
+# create DESeq2 object
+dds <- DESeqDataSetFromMatrix(countData = round(txi_salmon$counts), # round to integer
+                              colData = sample_metadata,
+                              design = ~1
+)
+dds
+```
+
+# pre-processing
+
+pre-filtering
+```{r}
+length(rownames(dds))
+```
+
+
+
+```{r}
+smallestGroupSize <- 5 # samples per timepoint and treatment
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize # keep genes with at least 10 counts in 5 samples
+dds <- dds[keep,]
+length(rownames(dds))
+```
+
+Save DESeq2 object
+```{r}
+# add date to file name
+date <- format(Sys.Date(), "%Y-%m-%d")
+# if dds folder doesn't exist, create it
+if (!dir.exists("data/dds")) {
+  dir.create("data/dds")
+}
+saveRDS(dds, paste0("data/dds/dds_", date, ".rds"))
+# save RsessionInfo in txt, with date
+sessionInfo <- sessionInfo()
+writeLines(capture.output(sessionInfo), paste0("data/dds/sessionInfo_", date, ".txt"))
+print("Done!")
+```
+

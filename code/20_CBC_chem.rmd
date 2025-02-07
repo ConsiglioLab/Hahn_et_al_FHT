@@ -1,0 +1,295 @@
+---
+title: "Reading cell count data from excel sheets"
+output: html_notebook
+---
+
+
+
+# load
+packages
+```{r}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(rsvd)
+library(emmeans)
+library(mgcv)
+library(performance)
+library(gtsummary)
+```
+
+load deconvolution results
+```{r}
+res_deconv <- read_tsv("results/tables/05deconv_resultsLongTable.tsv")
+
+```
+
+load other metadata and tables
+```{r}
+metadata <- read_tsv("data/metadata_processed/metadata.txt")
+animal_meta <- read_tsv("data/metadata_processed/animal_meta.txt" ) %>% select_all(~gsub("-", "_", .))
+# translation table for gate names
+gate_translation <- read_excel("data/metadata_raw/trans_gate_names_flow.xlsx")
+gatecounts_translation <- read_excel("data/metadata_raw/trans_gate_names_flow.xlsx", sheet = 2)
+# translation tabs
+cbc_trans <- read_tsv("data/metadata_processed/CBC_Abbreviations_Full_Names.tsv")
+chem_trans <- read_tsv("data/metadata_processed/Chem_Panel_Abbreviations_Full_Names.tsv", col_types = cols(.default = "c"), na=character())
+# sc ct names
+sc_blood_names <- read_tsv("data/metadata_processed/sc_blood_names.tsv")
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+```
+
+# cbc data
+
+```{r}
+cbc_data <- read_excel("data/metadata_raw/FHT CBC and Chemistry.xlsx", sheet = "CBC",
+                       skip=1 # skip row one because it just repeats the headers
+) %>%
+        # remove animal that was taken off the study
+        filter(Id != "Rh-12") %>%
+        # add animal metadata
+        left_join(animal_meta, by = c("Id" = "Animal")) %>%
+        mutate(Time_of_day= hour(Date) + minute(Date)/60,
+                Date_day = date(Date)) # ignore hour:min
+
+
+cbc_data <- cbc_data %>%
+        # drop empty row
+        filter(!is.na(Id)) %>%
+        # add first date for each group
+        mutate(first_date = ifelse(Treatment == "E2",
+                                           ymd("20220706"), # E2 first date
+                                                ymd("20220707"))) %>% # Placebo first date
+        mutate(first_date = as.Date(first_date)) %>%
+        # create interlval since earliest date in weeks
+        mutate(Weeks_passed = int_length(interval(start=first_date, end=Date_day))/604800) %>%
+        mutate(Week_post_FHT = round(Weeks_passed) )
+
+# make long format
+cbc_data_long <- cbc_data %>%
+        select(-c(first_date)) %>%
+        pivot_longer(-c(Date_day,Date,Time_of_day, Weeks_passed, Week_post_FHT, Id, Treatment, Sex, Age_y, Weight_kg, MHC_I), names_to = "name", values_to = "value") %>%
+        # filter out NA values
+        filter(!is.na(value)) %>%
+        group_by(Id, name, Week_post_FHT) %>%
+        # if value two numbers, take the mean, numbers are separated by commas, otherwise, just take the number
+        mutate(value = ifelse(str_detect(value, ","),
+                                mean(unlist(lapply(str_split(value, ","),as.numeric)), na.rm = T),
+                                as.numeric(value)))
+```
+
+plot date timepoints animal
+```{r}
+cbc_data %>%
+        ggplot(aes(x=Week_post_FHT, y = Id, color =Treatment)) +
+        geom_point( size=5) +
+ scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+theme_bw()
+
+```
+
+plot time of day
+
+```{r}
+cbc_data %>%
+        ggplot(aes(y=Time_of_day, x = Week_post_FHT, color =Treatment)) +
+        geom_point( size=2) +
+        facet_wrap(~Treatment) +
+        scale_x_continuous(breaks = unique(cbc_data$Week_post_FHT)) +
+        scale_y_reverse(breaks = c(0, 6, 12, 18, 24)) +
+ scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+theme_minimal() -> cbc_time_of_day_plot
+cbc_time_of_day_plot
+
+ggsave("results/plot/flowdata/cbc_time_of_day_plot.pdf", cbc_time_of_day_plot, width = 20, height = 10, dpi=600)
+```
+The week 18 00:00 time really is like that on the time
+
+
+plot data
+
+```{r}
+data<- cbc_data_long %>%
+        left_join(cbc_trans, by = c("name" = "Abbreviation"))
+data %>%
+        group_by(Week_post_FHT, Treatment, name) %>%
+        mutate(meanValue = mean(value, na.rm = T), sdValue = sd(value, na.rm=T)) %>%
+        filter(Id %in% c("Rh-16", "Rh-05")) %>% # just one animal per group so one ribbon
+        # ymin and ymax for the ribbon
+        mutate(lowerValue= meanValue - sdValue, upperValue = meanValue + sdValue) %>% # calculate mean and sd
+        # correct to 0 if negative
+        mutate(lowerValue = ifelse(lowerValue < 0, 0, lowerValue)) %>%
+        ggplot(aes(x=Week_post_FHT, group=Id, fill=Treatment)) +
+        facet_wrap(~Full_Name, scales="free") +
+        geom_vline(xintercept = c(18,22), linetype = "dashed") + # adjust to vaccination timepoints
+        geom_line(aes(y=meanValue, color=Treatment)) +
+        geom_ribbon(aes(ymin=lowerValue, ymax=upperValue), alpha=0.5)+
+          scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+          scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        geom_point(data = data, aes(x=Week_post_FHT, y=value, color=Treatment), size =1) +
+        labs(title = "CBC data", x = "Week post FHT", y = "") +
+        xlim(-2, 30) +
+        theme_classic() -> CBC_line_plot
+CBC_line_plot
+ggsave("results/plot/flowdata/CBC_line_plot.pdf", CBC_line_plot + ylim(0, NA), width = 20, height = 10, dpi=600)
+# no ylim
+ggsave("results/plot/flowdata/CBC_line_plot_no_ylimit.pdf", CBC_line_plot, width = 20, height = 10, dpi=600)
+# save rds
+saveRDS(data, "results/plot/flowdata/CBC_line_plot_data.rds")
+
+```
+
+cbc data but with animal lines instead of points
+```{r}
+data %>%
+        group_by(Week_post_FHT, Treatment, name) %>%
+        mutate(meanValue = mean(value, na.rm = T), sdValue = sd(value, na.rm=T)) %>%
+        filter(Id %in% c("Rh-16", "Rh-05")) %>% # just one animal per group so one ribbon
+        # ymin and ymax for the ribbon
+        mutate(lowerValue= meanValue - sdValue, upperValue = meanValue + sdValue) %>% # calculate mean and sd
+        # correct to 0 if negative
+        mutate(lowerValue = ifelse(lowerValue < 0, 0, lowerValue)) %>%
+        ggplot(aes(x=Week_post_FHT, group=Id, fill=Treatment)) +
+        facet_wrap(~Full_Name, scales="free") +
+        geom_vline(xintercept = c(18,22), linetype = "dashed") + # adjust to vaccination timepoints
+        geom_line(aes(y=meanValue, color=Treatment), linetype="dashed") +
+        geom_ribbon(aes(ymin=lowerValue, ymax=upperValue), alpha=0.5)+
+          scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+          scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+        geom_line(data=data, aes(group=Id, y=value, color=Treatment)) +
+        labs(title = "CBC data", x = "Week post FHT", y = "") +
+        xlim(-2, 30) +
+        theme_classic() -> CBC_animal_line_plot
+CBC_animal_line_plot
+ggsave("results/plot/flowdata/CBC_animal_line_plot.pdf", CBC_animal_line_plot + ylim(0, NA), width = 20, height = 10, dpi=600)
+# no ylim
+ggsave("results/plot/flowdata/CBC_animal_line_plot_no_ylimit.pdf", CBC_animal_line_plot, width = 20, height = 10, dpi=600)
+# save rds
+saveRDS(data, "results/plot/flowdata/CBC_animal_line_plot_data.rds")
+```
+
+
+
+
+
+
+# chemistry data
+```{r}
+chem_data <- read_excel("data/metadata_raw/FHT CBC and Chemistry.xlsx", sheet = "Chemistry",
+                       skip=1 # skip row one because it just repeats the headers
+) %>%
+        # remove animal that was taken off the study
+        filter(Id != "Rh-12") %>%
+        # add animal metadata
+        left_join(animal_meta, by = c("Id" = "Animal")) %>%
+        mutate(Time_of_day = hour(Date) + minute(Date)/60,
+                Date_day = date(Date)) # ignore hour:min
+
+
+chem_data <- chem_data %>%
+        # drop empty row
+        filter(!is.na(Id)) %>%
+        # add first date for each group
+        mutate(first_date = ifelse(Treatment == "E2",
+                                           ymd("20220706"), # E2 first date
+                                                ymd("20220707"))) %>% # Placebo first date
+        mutate(first_date = as.Date(first_date)) %>%
+        # create interlval since earliest date in weeks
+        mutate(Weeks_passed = int_length(interval(start=first_date, end=Date_day))/604800) %>%
+        mutate(Week_post_FHT = round(Weeks_passed) )
+
+# make long format
+chem_data_long <- chem_data %>%
+        select(-c(first_date)) %>%
+        pivot_longer(-c(Date_day, Date, Time_of_day, Weeks_passed, Week_post_FHT, Id, Treatment, Sex, Age_y, Weight_kg, MHC_I), names_to = "name", values_to = "value") %>%
+        # filter out NA values
+        filter(!is.na(value)) %>%
+        group_by(Id, name, Week_post_FHT) %>%
+        # if value two numbers, take the mean, numbers are separated by commas, otherwise, just take the number
+        mutate(value = ifelse(str_detect(value, ","),
+                                mean(unlist(lapply(str_split(value, ","),as.numeric)), na.rm = T),
+                                as.numeric(value)))
+```
+
+plot date timepoints animal
+```{r}
+chem_data %>%
+        ggplot(aes(x=Week_post_FHT, y = Id, color =Treatment)) +
+        geom_point( size=5) +
+        geom_vline(xintercept = c(18,22), linetype = "dashed") +
+        labs(title = "Chem data", x = "Week post FHT", y = "Animal") +
+        xlim(-2, 30) + scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+theme_bw()
+
+```
+
+plot time of day
+
+```{r}
+chem_data %>%
+        ggplot(aes(y=Time_of_day, x = Week_post_FHT, color =Treatment)) +
+        geom_point( size=2) +
+        geom_vline(xintercept = c(18,22), linetype="dashed")+
+        facet_wrap(~Treatment) +
+        scale_x_continuous(breaks = unique(chem_data$Week_post_FHT)) +
+        scale_y_continuous(breaks = c(0, 6, 12, 18, 24)) +
+        scale_y_reverse() +
+        labs(title = "Chem data", x = "Week post FHT", y = "Time of day") +
+        xlim(-2, 30) +
+ scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+theme_minimal() -> chem_time_of_day_plot
+chem_time_of_day_plot
+
+ggsave("results/plot/flowdata/chem_time_of_day_plot.pdf", chem_time_of_day_plot, width = 20, height = 10, dpi=600)
+```
+
+
+## plot data
+
+
+chemistry but with animal lines instead of points
+```{r}
+data %>%
+        group_by(Week_post_FHT, Treatment, name) %>%
+        mutate(meanValue = mean(value, na.rm = T), sdValue = sd(value, na.rm=T)) %>%
+        filter(Id %in% c("Rh-16", "Rh-05")) %>% # just one animal per group so one ribbon
+        # ymin and ymax for the ribbon
+        mutate(lowerValue= meanValue - sdValue, upperValue = meanValue + sdValue) %>% # calculate mean and sd
+        # correct to 0 if negative
+        mutate(lowerValue = ifelse(lowerValue < 0, 0, lowerValue)) %>%
+        ggplot(aes(x=Week_post_FHT, group=Id, fill=Treatment)) +
+        facet_wrap(~Full_Name, scales="free") +
+        geom_vline(xintercept = c(18,22), linetype = "dashed") + # adjust to vaccination timepoints
+        geom_line(aes(y=meanValue, color=Treatment), linetype="dashed") +
+        geom_ribbon(aes(ymin=lowerValue, ymax=upperValue), alpha=0.5)+
+          scale_color_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+          scale_fill_manual(values = c("E2" = "#8A69D4", "Placebo" = "#FFD635")) +
+                  geom_line(data=data, aes(y=value, color=Treatment, group=Id)) +
+        labs(title = "Chem data", x = "Week post FHT", y = "") +
+        xlim(-2, 30) +
+
+        theme_classic() -> chem_animal_line_plot
+
+chem_animal_line_plot
+ggsave("results/plot/flowdata/chem_animal_line_plot.pdf", chem_animal_line_plot + ylim(0, NA) , width = 20, height = 10, dpi=600)
+# no ylim
+ggsave("results/plot/flowdata/chem_animal_line_plot_no_ylimit.pdf", chem_animal_line_plot, width = 20, height = 10, dpi=600)
+# save rds
+saveRDS(data, "results/plot/flowdata/chem_animal_line_plot_data.rds")
+```
+

@@ -1,0 +1,271 @@
+---
+title: "DEG with DESeq2"
+output: html_notebook
+---
+First set the root directory as the working directory.
+By default getwd() is the directory of the markdown file.
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = dirname(getwd()))
+```
+
+```{r warning=FALSE, message=FALSE}
+library(DESeq2)
+library(tidyverse)
+library(ggplot2)
+library(viridis)
+library(ggh4x)
+library(patchwork)
+library(ggrepel)
+library(UpSetR)
+library(clusterProfiler)
+library(org.Mmu.eg.db)
+library(openxlsx)
+source("scripts/translate_mmul-human.R")
+```
+
+load the dds object
+```{r}
+file_name <- list.files("data/dds/")
+# only rds
+file_name <- file_name[grepl("rds", file_name)]
+# take the most recent file
+file_name <- file_name[length(file_name)]
+dds <- readRDS(paste0("data/dds/", file_name))
+```
+
+Create design matrices
+```{r}
+sample_metadata <- colData(dds)
+# full design
+design <- model.matrix(~ Batch + Treatment:Animal.n + Treatment + Week_post_FHT + Treatment:Week_post_FHT, sample_metadata)
+# remove duplicates
+idx <- which(apply(design, 2, function(x) all(x==0)))
+if (length(idx) > 0) design <- design[,-idx]
+
+# reduced designs
+design_red_TreTime <- model.matrix(~  Batch + Treatment + Week_post_FHT + Treatment:Animal.n, sample_metadata)
+
+# remove duplicates
+idx <- which(apply(design_red_TreTime, 2, function(x) all(x==0)))
+if (length(idx) > 0) design_red_TreTime <- design_red_TreTime[,-idx]
+```
+
+Run DESeq2
+
+```{r}
+dds <- DESeq(dds,
+             full = design # full design table
+)
+res <- results(dds)
+res
+# save dds object with date
+# create folder if it does not exist
+if (!dir.exists("results/dds")) dir.create("results/dds")
+saveRDS(dds, paste0("results/dds/dds", format(Sys.Date(), "%Y%m%d"), ".rds"))
+```
+
+
+Explore results.
+
+```{r}
+list_res <- list()
+for (res_name in resultsNames(dds)) {
+  res <- results(dds, name = res_name)
+  list_res[[res_name]] <- results(dds, name = res_name, tidy = TRUE)
+  # res
+  print(res_name)
+  summary(res)
+}
+```
+save tables to excel
+```{r}
+# if folder does not exist, create it
+if (!dir.exists("results/tables/02_DEG")) dir.create("results/tables/02_DEG")
+write.xlsx(list_res, "results/tables/02_DEG/results_DESeq2.xlsx")
+```
+
+
+plot p-values
+
+```{r}
+# collapse result tables from list and add column with the name of the result
+all_res <- bind_rows(list_res, .id = "result_name")
+# plot p-values
+p_value <- all_res%>%
+        drop_na(padj) %>%
+        ggplot(aes(x = pvalue) )+
+  geom_histogram(aes(y=after_stat(count/sum(count))), breaks = seq(0, 1, 0.05),
+                 color = "black", fill = "grey") +
+  # Remove space between x-axis and min(y)
+  scale_y_continuous(expand = expansion(c(0, 0.05))) +
+  facet_wrap(vars(result_name), scales="free_y") + # separate plots
+  theme_bw(base_size = 12)
+p_value
+```
+
+# save plot
+```{r}
+pdf("results/plot/02_DEG/p_value_histogram.pdf", width = 15, height = 10)
+p_value
+dev.off()
+```
+
+
+
+
+# upset plots with results
+All results
+
+```{r}
+# get significant genes
+result_names <- resultsNames(dds)
+# result_names <- result_names[!grepl("Animal", result_names)]
+# result_names <- result_names[!grepl("Batch", result_names)]
+sig_genes <- list()
+for (res_name in result_names) {
+  res <- results(dds, name = res_name, tidy = TRUE)
+  if (length(res) == 0) next
+  sig_genes[[res_name]] <- na.omit(res[res$padj < 0.05,]$row)
+}
+# remove Intercept
+sig_genes <- sig_genes[-1]
+
+upset <-  upset(fromList(sig_genes), sets.bar.color = "#566be9", main.bar.color = "#566be9", order.by = "freq",
+      nsets = length(result_names)-1)
+print(upset)
+pdf("results/plot/02_DEG/upset.pdf", width = 20, height = 12, onefile=F)
+upset
+dev.off()
+```
+
+
+ just E2 effects
+```{r}
+# get significant genes
+result_names <- resultsNames(dds)
+result_names <- result_names[grepl("E2.W", result_names)]
+
+sig_genes <- list()
+for (res_name in result_names) {
+  res <- results(dds, name = res_name, tidy = TRUE)
+   if (length(res) == 0) next
+  sig_genes[[res_name]] <- na.omit(res[res$padj < 0.05,]$row)
+}
+
+
+upset_E2<- upset(fromList(sig_genes), sets.bar.color = "#566be9", main.bar.color = "#566be9", order.by = "freq",
+      nsets = length(result_names)-1, text.scale = 2)
+print(upset_E2)
+
+pdf("results/plot/02_DEG/upset_E2_effects.pdf", onefile = F)
+upset_E2
+dev.off()
+```
+
+vaccination effects
+```{r}
+# get significant genes
+result_names <- resultsNames(dds)
+result_names <- result_names[grepl("^W", result_names)]
+
+sig_genes <- list()
+for (res_name in result_names) {
+  res <- results(dds, name = res_name, tidy = TRUE)
+   if (length(res) == 0) next
+  sig_genes[[res_name]] <- na.omit(res[res$padj < 0.05,]$row)
+}
+
+
+upset_Vax <- upset(fromList(sig_genes), sets.bar.color = "#566be9", main.bar.color = "#566be9", order.by = "freq",
+      nsets = length(result_names)-1, text.scale = 2)
+print(upset_Vax)
+pdf("results/plot/02_DEG/upset_vax_effects.pdf", onefile=F)
+upset_Vax
+dev.off()
+```
+
+# Make heatmaps
+
+Get vsd count matrix for visualization
+```{r}
+# transform to vst
+vsd <- vst(dds, blind=FALSE)
+# make dataframae with counts
+vsd <- assay(vsd)
+vsd <- as.data.frame(vsd)
+vsd_scaled <- t(scale(t(vsd)))
+# save vsd
+
+```
+
+For every week, make a heatmap with all the significant genes for the interaction
+```{r warning=FALSE, message=FALSE}
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[-1]
+result_names <- result_names[grepl("Week", result_names)]
+
+
+heatmap_list <- list()
+for (res_name in result_names) {
+  heatmap_list[[res_name]] <- get_heatmap_res(res_name, vsd_scaled, dds, trans_table = trans_table)
+}
+
+pdf("results/plot/02_DEG/heatmap_weeks.pdf", width = 15, height = 10)
+heatmap_list
+dev.off()
+```
+
+all of them
+```{r} warning=FALSE, message=FALSE}
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[-1]
+
+
+heatmap_list <- list()
+for (res_name in result_names) {
+  heatmap_list[[res_name]] <- get_heatmap_res(res_name, vsd_scaled, dds, trans_table = trans_table)
+}
+
+pdf("results/plot/02_DEG/heatmap_all.pdf", width = 15, height = 10)
+heatmap_list
+dev.off()
+```
+
+
+
+# Volcano plots
+
+```{r}
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[-1]
+
+# get max log2 fold change across all of them for xlim, centered at 0
+max_lfc <- lapply(result_names, function(x) max(abs(results(dds, name = x, tidy = TRUE)$log2FoldChange)))
+max_lfc <- max(as.numeric(unlist(max_lfc)))
+
+volcano_list <- lapply(result_names, function(x) get_vln_plot(dds, x, trans_table, xlim=c(-max_lfc, max_lfc)))
+pdf("results/plot/02_DEG/volcano.pdf", width = 15, height = 10)
+volcano_list
+dev.off()
+```
+
+# Tables
+save results table
+```{r}
+result_names <- resultsNames(dds)
+# remove intercept
+result_names <- result_names[-1]
+# save each table as sheet of excel
+library(openxlsx)
+result_table_list <- list()
+for (res_name in result_names) {
+  res <- results(dds, name = res_name, tidy = TRUE)
+    result_table_list[[res_name]] <- res
+}
+write.xlsx(result_table_list, "results/tables/02_DEG/results_DESeq2.xlsx")
+```
+
+
